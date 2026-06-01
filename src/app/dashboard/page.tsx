@@ -27,6 +27,11 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Alert,
+  AlertTitle,
+  AlertDescription,
+} from "@/components/ui/alert";
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -77,6 +82,20 @@ type DashboardState =
       pools: QuotaPoolWithUsage[];
       devices: DeviceInfo[];
     };
+
+// ── Alert Types ────────────────────────────────────────────────
+
+type AlertLevel = "warning" | "critical" | "exhausted";
+
+type PoolAlert = {
+  level: AlertLevel;
+  poolName: string;
+  usagePercent: number;
+  windowName: string;
+  source: string;
+  confidence: string | undefined;
+  resetPolicy: string;
+};
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -141,6 +160,157 @@ function timeAgo(dateStr: string | null): string {
   if (diffHr < 24) return `${diffHr}h ago`;
   const diffDay = Math.floor(diffHr / 24);
   return `${diffDay}d ago`;
+}
+
+// ── Alert Logic ────────────────────────────────────────────────
+
+function computeAlerts(pools: QuotaPoolWithUsage[]): PoolAlert[] {
+  const alerts: PoolAlert[] = [];
+
+  for (const pool of pools) {
+    const pct = usagePercentage(pool);
+    // Unknown usage: no usageCurrent, no totalAllocated, or pct is null → skip
+    if (pct === null) continue;
+    const total = Number(pool.totalAllocated);
+    if (total <= 0) continue;
+
+    let level: AlertLevel | null = null;
+    if (pct >= 100) {
+      level = "exhausted";
+    } else if (pct >= 90) {
+      level = "critical";
+    } else if (pct >= 70) {
+      level = "warning";
+    }
+
+    if (level) {
+      alerts.push({
+        level,
+        poolName: pool.displayName,
+        usagePercent: pct,
+        windowName: pool.usageCurrent?.windowName ?? "—",
+        source: sourceLabel(pool),
+        confidence: pool.confidence,
+        resetPolicy: pool.rolloverPolicy,
+      });
+    }
+  }
+
+  // Sort: exhausted first, then critical, then warning
+  const levelOrder: Record<AlertLevel, number> = { exhausted: 0, critical: 1, warning: 2 };
+  alerts.sort((a, b) => levelOrder[a.level] - levelOrder[b.level]);
+
+  return alerts;
+}
+
+// ── Alert UI ───────────────────────────────────────────────────
+
+const alertLevelConfig: Record<AlertLevel, { label: string; badgeClass: string; borderClass: string; bgClass: string }> = {
+  warning: {
+    label: "Warning",
+    badgeClass: "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30",
+    borderClass: "border-amber-500/30",
+    bgClass: "bg-amber-500/5",
+  },
+  critical: {
+    label: "Critical",
+    badgeClass: "bg-orange-500/10 text-orange-600 dark:text-orange-400 border-orange-500/30",
+    borderClass: "border-orange-500/30",
+    bgClass: "bg-orange-500/5",
+  },
+  exhausted: {
+    label: "Exhausted",
+    badgeClass: "bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/30",
+    borderClass: "border-red-500/30",
+    bgClass: "bg-red-500/5",
+  },
+};
+
+function AlertsBanner({ alerts }: { alerts: PoolAlert[] }) {
+  if (alerts.length === 0) return null;
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2">
+        <svg
+          className="h-5 w-5 text-amber-500"
+          fill="none"
+          viewBox="0 0 24 24"
+          strokeWidth={1.5}
+          stroke="currentColor"
+        >
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z"
+          />
+        </svg>
+        <h2 className="text-lg font-semibold">Alerts</h2>
+        <Badge variant="outline" className="ml-1">
+          {alerts.length}
+        </Badge>
+      </div>
+      <div className="space-y-2">
+        {alerts.map((alert, idx) => {
+          const cfg = alertLevelConfig[alert.level];
+          return (
+            <Alert key={`${alert.poolName}-${idx}`} className={`${cfg.borderClass} ${cfg.bgClass}`}>
+              <AlertTitle className="flex items-center gap-2">
+                <Badge className={cfg.badgeClass}>{cfg.label}</Badge>
+                <span className="font-medium">{alert.poolName}</span>
+              </AlertTitle>
+              <AlertDescription>
+                <div className="mt-1 grid grid-cols-2 gap-x-4 gap-y-1 text-xs sm:grid-cols-4">
+                  <div>
+                    <span className="text-muted-foreground">Usage: </span>
+                    <span className="font-medium tabular-nums">{alert.usagePercent}%</span>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Window: </span>
+                    <span className="font-medium">{alert.windowName}</span>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Source: </span>
+                    <span className="font-medium">{alert.source}</span>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Confidence: </span>
+                    <span className="font-medium">{alert.confidence ?? "—"}</span>
+                  </div>
+                  <div className="col-span-2 sm:col-span-4">
+                    <span className="text-muted-foreground">Reset: </span>
+                    <span className="font-medium">{resetLabel(alert.resetPolicy)}</span>
+                  </div>
+                </div>
+              </AlertDescription>
+            </Alert>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function PoolAlertBadge({ pct }: { pct: number | null }) {
+  if (pct === null) return null;
+
+  let label: string;
+  let className: string;
+
+  if (pct >= 100) {
+    label = "Exhausted";
+    className = "bg-red-600 hover:bg-red-600 text-white";
+  } else if (pct >= 90) {
+    label = "Critical";
+    className = "bg-orange-500 hover:bg-orange-500 text-white";
+  } else if (pct >= 70) {
+    label = "Warning";
+    className = "bg-amber-500 hover:bg-amber-500 text-white";
+  } else {
+    return null;
+  }
+
+  return <Badge className={className}>{label}</Badge>;
 }
 
 // ── Loading Skeleton ───────────────────────────────────────────
@@ -308,7 +478,10 @@ function PoolCard({ pool }: { pool: QuotaPoolWithUsage }) {
               </Badge>
             </CardDescription>
           </div>
-          {confidenceBadge(pool)}
+          <div className="flex items-center gap-2">
+            <PoolAlertBadge pct={pct} />
+            {confidenceBadge(pool)}
+          </div>
         </div>
       </CardHeader>
 
@@ -714,6 +887,8 @@ export default function DashboardPage() {
     }
   }, []);
 
+  const alerts = state.status === "loaded" ? computeAlerts(state.pools) : [];
+
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
       <div className="mb-8">
@@ -738,6 +913,13 @@ export default function DashboardPage() {
       {state.status === "empty" && <EmptyState />}
       {state.status === "loaded" && (
         <div className="space-y-8">
+          {alerts.length > 0 && (
+            <>
+              <AlertsBanner alerts={alerts} />
+              <Separator />
+            </>
+          )}
+
           <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
             {state.pools.map((pool) => (
               <PoolCard key={pool.id} pool={pool} />
