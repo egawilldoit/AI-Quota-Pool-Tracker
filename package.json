@@ -14,7 +14,10 @@
     "typecheck": "tsc --noEmit",
     "agent:dry-run": "node scripts/ega-devtrack.js once --dry-run",
     "agent:privacy-report": "node scripts/ega-devtrack.js privacy-report",
-    "agent:help": "node scripts/ega-devtrack.js --help"
+    "agent:help": "node scripts/ega-devtrack.js --help",
+    "agent:install": "node scripts/ega-devtrack.js install",
+    "agent:uninstall": "node scripts/ega-devtrack.js uninstall",
+    "agent:status": "node scripts/ega-devtrack.js status"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
