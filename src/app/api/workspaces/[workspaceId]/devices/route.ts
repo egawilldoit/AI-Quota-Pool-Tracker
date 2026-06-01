@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDevicesForWorkspace } from "@/lib/devices";
+import { getDevicesWithHealth } from "@/lib/devices";
 
 export async function GET(
   _request: NextRequest,
@@ -7,7 +7,7 @@ export async function GET(
 ) {
   try {
     const { workspaceId } = await params;
-    const devicesList = await getDevicesForWorkspace(workspaceId);
+    const devicesList = await getDevicesWithHealth(workspaceId);
     return NextResponse.json({ devices: devicesList });
   } catch (error) {
     const message =

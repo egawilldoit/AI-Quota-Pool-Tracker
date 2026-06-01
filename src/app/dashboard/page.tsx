@@ -62,6 +62,9 @@ type DeviceInfo = {
   agentVersion: string | null;
   lastSeenAt: string | null;
   createdAt: string;
+  healthState: "active" | "stale" | "offline" | "unknown";
+  lastHeartbeat: string | null;
+  freshnessMinutes: number | null;
 };
 
 type DashboardState =
@@ -532,7 +535,25 @@ function RecordManualUsageDialog({ pool }: { pool: QuotaPoolWithUsage }) {
 
 // ── Device Card ────────────────────────────────────────────────
 
+function healthBadge(healthState: string) {
+  switch (healthState) {
+    case "active":
+      return <Badge className="bg-green-600 hover:bg-green-600">Active</Badge>;
+    case "stale":
+      return <Badge className="bg-yellow-500 hover:bg-yellow-500">Stale</Badge>;
+    case "offline":
+      return <Badge className="bg-red-600 hover:bg-red-600">Offline</Badge>;
+    default:
+      return <Badge variant="secondary">Unknown</Badge>;
+  }
+}
+
 function DeviceCard({ device }: { device: DeviceInfo }) {
+  const lastSeenInfo = device.lastHeartbeat ?? device.lastSeenAt;
+  const lastSeenText = lastSeenInfo ? timeAgo(lastSeenInfo) : "Never";
+  const osInfo = device.os || "Unknown OS";
+  const agentInfo = device.agentVersion ? `v${device.agentVersion}` : null;
+
   return (
     <div className="flex items-center justify-between rounded-lg border p-3">
       <div className="flex items-center gap-3">
@@ -554,15 +575,13 @@ function DeviceCard({ device }: { device: DeviceInfo }) {
         <div>
           <p className="text-sm font-medium">{device.label || "Unnamed device"}</p>
           <p className="text-xs text-muted-foreground">
-            {device.os || "Unknown OS"}
-            {device.agentVersion ? ` · v${device.agentVersion}` : ""}
-            {device.lastSeenAt ? ` · Seen ${timeAgo(device.lastSeenAt)}` : " · Never seen"}
+            {osInfo}
+            {agentInfo ? ` · ${agentInfo}` : ""}
+            {` · Seen ${lastSeenText}`}
           </p>
         </div>
       </div>
-      <Badge variant={device.lastSeenAt ? "default" : "ghost"}>
-        {device.lastSeenAt ? "Active" : "Pending"}
-      </Badge>
+      {healthBadge(device.healthState)}
     </div>
   );
 }
