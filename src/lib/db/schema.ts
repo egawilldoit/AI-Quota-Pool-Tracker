@@ -57,22 +57,34 @@ export const quotaPools = pgTable(
 );
 
 // ── Devices ───────────────────────────────────────────────────
-export const devices = pgTable("devices", {
-  id: uuid("id").defaultRandom().primaryKey(),
-  workspaceId: uuid("workspace_id")
-    .references(() => workspaces.id, { onDelete: "cascade" })
-    .notNull(),
-  deviceFingerprint: text("device_fingerprint").notNull(),
-  label: text("label"),
-  lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
-  createdAt: timestamp("created_at", { withTimezone: true })
-    .defaultNow()
-    .notNull(),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .defaultNow()
-    .notNull()
-    .$onUpdate(() => new Date()),
-});
+export const devices = pgTable(
+  "devices",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    workspaceId: uuid("workspace_id")
+      .references(() => workspaces.id, { onDelete: "cascade" })
+      .notNull(),
+    deviceFingerprint: text("device_fingerprint").notNull(),
+    label: text("label"),
+    os: text("os"),
+    agentVersion: text("agent_version"),
+    tokenHash: text("token_hash").notNull().unique(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull()
+      .$onUpdate(() => new Date()),
+  },
+  (table) => [
+    uniqueIndex("uq_device_workspace_fingerprint").on(
+      table.workspaceId,
+      table.deviceFingerprint,
+    ),
+  ],
+);
 
 // ── Tool Instances ────────────────────────────────────────────
 export const toolInstances = pgTable("tool_instances", {
