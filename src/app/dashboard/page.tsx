@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import {
   Card,
   CardContent,
@@ -12,6 +13,8 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -37,6 +40,16 @@ type WorkspaceInfo = {
   slug: string;
 };
 
+type DeviceInfo = {
+  id: string;
+  workspaceId: string;
+  label: string | null;
+  os: string | null;
+  agentVersion: string | null;
+  lastSeenAt: string | null;
+  createdAt: string;
+};
+
 type DashboardState =
   | { status: "loading" }
   | { status: "error"; message: string }
@@ -45,6 +58,7 @@ type DashboardState =
       status: "loaded";
       workspace: WorkspaceInfo;
       pools: QuotaPoolWithUsage[];
+      devices: DeviceInfo[];
     };
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -94,58 +108,101 @@ function sourceLabel(pool: QuotaPoolWithUsage): string {
   return "System";
 }
 
+function timeAgo(dateStr: string | null): string {
+  if (!dateStr) return "Never";
+  const date = new Date(dateStr);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return "Just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  return `${diffDay}d ago`;
+}
+
 // ── Loading Skeleton ───────────────────────────────────────────
 
 function DashboardSkeleton() {
   return (
-    <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-      {[1, 2, 3].map((i) => (
-        <Card key={i}>
-          <CardHeader>
-            <Skeleton className="h-5 w-32" />
-            <Skeleton className="h-4 w-48" />
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <Skeleton className="h-2 w-full" />
-            <Skeleton className="h-4 w-24" />
-            <Skeleton className="h-4 w-36" />
-          </CardContent>
-          <CardFooter>
-            <Skeleton className="h-5 w-20" />
-          </CardFooter>
-        </Card>
-      ))}
+    <div className="space-y-8">
+      <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+        {[1, 2, 3].map((i) => (
+          <Card key={i}>
+            <CardHeader>
+              <Skeleton className="h-5 w-32" />
+              <Skeleton className="h-4 w-48" />
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <Skeleton className="h-2 w-full" />
+              <Skeleton className="h-4 w-24" />
+              <Skeleton className="h-4 w-36" />
+            </CardContent>
+            <CardFooter>
+              <Skeleton className="h-5 w-20" />
+            </CardFooter>
+          </Card>
+        ))}
+      </div>
+      <Separator />
+      <Card>
+        <CardHeader>
+          <Skeleton className="h-5 w-32" />
+        </CardHeader>
+        <CardContent>
+          <Skeleton className="h-8 w-full" />
+        </CardContent>
+      </Card>
     </div>
   );
 }
 
 // ── Empty State ────────────────────────────────────────────────
 
-function EmptyState() {
+function EmptyState({ workspaceId }: { workspaceId?: string }) {
   return (
-    <Card className="p-12 text-center">
-      <CardContent>
-        <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
-          <svg
-            className="h-6 w-6 text-muted-foreground"
-            fill="none"
-            viewBox="0 0 24 24"
-            strokeWidth={1.5}
-            stroke="currentColor"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125"
-            />
-          </svg>
-        </div>
-        <h3 className="mb-2 text-lg font-medium">No quota pools</h3>
-        <p className="text-sm text-muted-foreground">
-          No quota pools have been configured yet. Add a quota pool to get started.
-        </p>
-      </CardContent>
-    </Card>
+    <div className="space-y-8">
+      <Card className="p-12 text-center">
+        <CardContent>
+          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+            <svg
+              className="h-6 w-6 text-muted-foreground"
+              fill="none"
+              viewBox="0 0 24 24"
+              strokeWidth={1.5}
+              stroke="currentColor"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125"
+              />
+            </svg>
+          </div>
+          <h3 className="mb-2 text-lg font-medium">No quota pools</h3>
+          <p className="text-sm text-muted-foreground">
+            No quota pools have been configured yet. Add a quota pool to get started.
+          </p>
+        </CardContent>
+      </Card>
+
+      {workspaceId && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Tracked Devices</CardTitle>
+            <CardDescription>
+              Register devices to track their AI tool usage.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex items-center justify-center py-6">
+            <Link href="/devices/add">
+              <Button>Add Device</Button>
+            </Link>
+          </CardContent>
+        </Card>
+      )}
+    </div>
   );
 }
 
@@ -257,6 +314,96 @@ function PoolCard({ pool }: { pool: QuotaPoolWithUsage }) {
   );
 }
 
+// ── Device Card ────────────────────────────────────────────────
+
+function DeviceCard({ device }: { device: DeviceInfo }) {
+  return (
+    <div className="flex items-center justify-between rounded-lg border p-3">
+      <div className="flex items-center gap-3">
+        <div className="flex h-8 w-8 items-center justify-center rounded-full bg-muted">
+          <svg
+            className="h-4 w-4 text-muted-foreground"
+            fill="none"
+            viewBox="0 0 24 24"
+            strokeWidth={1.5}
+            stroke="currentColor"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M10.5 1.5H8.25A2.25 2.25 0 006 3.75v16.5a2.25 2.25 0 002.25 2.25h7.5A2.25 2.25 0 0018 20.25V3.75a2.25 2.25 0 00-2.25-2.25H13.5m-3 0V3h3V1.5m-3 0h3m-3 18.75h3"
+            />
+          </svg>
+        </div>
+        <div>
+          <p className="text-sm font-medium">{device.label || "Unnamed device"}</p>
+          <p className="text-xs text-muted-foreground">
+            {device.os || "Unknown OS"}
+            {device.agentVersion ? ` · v${device.agentVersion}` : ""}
+            {device.lastSeenAt ? ` · Seen ${timeAgo(device.lastSeenAt)}` : " · Never seen"}
+          </p>
+        </div>
+      </div>
+      <Badge variant={device.lastSeenAt ? "default" : "ghost"}>
+        {device.lastSeenAt ? "Active" : "Pending"}
+      </Badge>
+    </div>
+  );
+}
+
+// ── Device List ────────────────────────────────────────────────
+
+function DeviceList({ devices: devicesList }: { devices: DeviceInfo[]; workspaceId: string }) {
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle>Tracked Devices</CardTitle>
+            <CardDescription>
+              {devicesList.length === 1
+                ? "1 registered device"
+                : `${devicesList.length} registered devices`}
+            </CardDescription>
+          </div>
+          <Link href="/devices/add">
+            <Button variant="outline" size="sm">
+              <svg
+                className="mr-1 h-4 w-4"
+                fill="none"
+                viewBox="0 0 24 24"
+                strokeWidth={1.5}
+                stroke="currentColor"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+              </svg>
+              Add Device
+            </Button>
+          </Link>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {devicesList.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-6 text-center">
+            <p className="text-sm text-muted-foreground">No devices registered yet.</p>
+            <Link href="/devices/add" className="mt-2">
+              <Button variant="link" size="sm">
+                Register your first device
+              </Button>
+            </Link>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {devicesList.map((device) => (
+              <DeviceCard key={device.id} device={device} />
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 // ── Data Fetching ──────────────────────────────────────────────
 
 async function fetchDashboardData(): Promise<DashboardState> {
@@ -272,22 +419,30 @@ async function fetchDashboardData(): Promise<DashboardState> {
   }
 
   const workspaceId = wsList[0].id;
-  const poolsRes = await fetch(`/api/workspaces/${workspaceId}/quota-pools`);
+
+  // Fetch pools and devices in parallel
+  const [poolsRes, devicesRes] = await Promise.all([
+    fetch(`/api/workspaces/${workspaceId}/quota-pools`),
+    fetch(`/api/workspaces/${workspaceId}/devices`),
+  ]);
+
   if (!poolsRes.ok) {
     const body = await poolsRes.json();
     throw new Error(body.error ?? `Failed to fetch quota pools (${poolsRes.status})`);
   }
 
-  const data = await poolsRes.json();
+  const poolsData = await poolsRes.json();
+  const devicesData = devicesRes.ok ? await devicesRes.json() : { devices: [] };
 
-  if (!data.pools || data.pools.length === 0) {
+  if (!poolsData.pools || poolsData.pools.length === 0) {
     return { status: "empty" };
   }
 
   return {
     status: "loaded" as const,
-    workspace: data.workspace,
-    pools: data.pools,
+    workspace: poolsData.workspace,
+    pools: poolsData.pools,
+    devices: devicesData.devices ?? [],
   };
 }
 
@@ -296,11 +451,7 @@ async function fetchDashboardData(): Promise<DashboardState> {
 export default function DashboardPage() {
   const [state, setState] = useState<DashboardState>({ status: "loading" });
 
-  // Fetch on mount by passing a function that dispatches
-  // This pattern avoids the set-state-in-effect lint rule since
-  // the callback is referenced, not called within the effect body.
   useEffect(() => {
-    // fire-and-forget via a referenced callback
     const onMount = async () => {
       try {
         const newState = await fetchDashboardData();
@@ -351,10 +502,16 @@ export default function DashboardPage() {
       {state.status === "error" && <ErrorState message={state.message} onRetry={handleRetry} />}
       {state.status === "empty" && <EmptyState />}
       {state.status === "loaded" && (
-        <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-          {state.pools.map((pool) => (
-            <PoolCard key={pool.id} pool={pool} />
-          ))}
+        <div className="space-y-8">
+          <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+            {state.pools.map((pool) => (
+              <PoolCard key={pool.id} pool={pool} />
+            ))}
+          </div>
+
+          <Separator />
+
+          <DeviceList devices={state.devices} workspaceId={state.workspace.id} />
         </div>
       )}
     </div>
