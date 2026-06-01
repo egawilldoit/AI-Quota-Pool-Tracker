@@ -34,7 +34,12 @@ export const UPLOADED_FIELDS = [
   { field: "toolInfos[].toolType", description: "AI tool type string (codex, opencode, hermes, ...)" },
   { field: "toolInfos[].displayName", description: "Human-readable display name" },
   { field: "toolInfos[].agentFingerprint", description: "Stable tool instance identifier" },
-  { field: "toolInfos[].metadata", description: "JSON blob (version, mode — never raw secrets)" },
+  { field: "toolInfos[].metadata", description: "JSON blob (version, mode, model — never raw secrets)" },
+
+  // Codex-specific fields (from ~/.codex/config.toml — model name only)
+  { field: "codex model name", description: "Model name from config.toml (e.g. gpt-5.5) — used to classify paid vs free pool" },
+  { field: "codex tool type", description: "Tool type identifier 'codex' for the Codex CLI" },
+  { field: "codex detection status", description: "Whether Codex CLI and config.toml were detected on the machine" },
 ];
 
 // ── Fields That Are NEVER Uploaded ────────────────────────────
