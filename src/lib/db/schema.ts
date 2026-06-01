@@ -151,6 +151,7 @@ export const usageSnapshots = pgTable(
       .notNull(),
     usageAmount: numeric("usage_amount", { precision: 20, scale: 6 })
       .notNull(),
+    windowName: text("window_name").notNull(),
     snapshotWindowStart: timestamp("snapshot_window_start", {
       withTimezone: true,
     }).notNull(),
@@ -159,6 +160,9 @@ export const usageSnapshots = pgTable(
     }).notNull(),
     idempotencyKey: text("idempotency_key").notNull().unique(),
     source: text("source").default("heartbeat").notNull(), // heartbeat, manual, import
+    confidence: numeric("confidence", { precision: 4, scale: 3 })
+      .default("1.0")
+      .notNull(),
     capturedAt: timestamp("captured_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
