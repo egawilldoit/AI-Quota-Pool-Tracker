@@ -5,14 +5,25 @@
  *
  * Commands:
  *   once --dry-run           Run collectors and print normalized payload (no upload)
+ *   once --upload            Run collectors and upload payload to server
  *   privacy-report           Print what's uploaded vs never uploaded
  *   install                  Install systemd timer to run agent every 15 minutes
  *   uninstall                Remove the systemd timer and service
- *   status                   Show scheduler status (last/next run, timer state)
+ *   status                   Show scheduler status (last/next run, timer state, spool health)
  *   --help                   Show this help
  *
- * All dry-run output is sanitized — no raw tokens/secrets appear.
- * Dry-run always exits 0 even when collectors fail.
+ * Upload flow:
+ *   1. On `once --upload`, the agent first reads the spool and retries any
+ *      previously failed uploads (oldest first).
+ *   2. Then it collects fresh data and attempts to upload.
+ *   3. If the upload fails, the payload is written to the local spool
+ *      (~/.local/share/ega-devtrack/spool/) for later retry.
+ *   4. Dry-run mode never writes to the spool.
+ *
+ *   The API endpoint is configured via the DEVTRAK_API_URL environment variable.
+ *   Default: http://localhost:3000
+ *
+ * All output is sanitized — no raw tokens/secrets appear.
  */
 
 import { runAllCollectors } from "../src/agent/collectors/index";
@@ -21,6 +32,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
+import { writeSpool, readSpool, deleteSpoolEntry, getSpoolHealth } from "../src/agent/spool";
 
 const args = process.argv.slice(2);
 
@@ -30,6 +42,7 @@ function showHelp(): void {
 
   USAGE:
     ega-devtrack once --dry-run         Collect & print normalized payload (no upload)
+    ega-devtrack once --upload          Collect, upload to server, retry spooled items
     ega-devtrack privacy-report         Print privacy report
     ega-devtrack install                Install systemd timer (runs every 15 min)
     ega-devtrack uninstall              Remove installed systemd timer & service
@@ -40,6 +53,16 @@ function showHelp(): void {
     --dry-run   Run collectors and output normalized payload to stdout.
                 Everything is sanitized. NO data is uploaded.
                 Exits 0 even if collectors fail.
+
+    --upload    Run collectors and upload the collected payload to the
+                configured API endpoint (DEVTRAK_API_URL, default
+                http://localhost:3000).
+                BEFORE collecting fresh data, any spooled items (failed
+                uploads from previous runs) are retried first.
+                Spool location: ~/.local/share/ega-devtrack/spool/
+
+  ENVIRONMENT:
+    DEVTRAK_API_URL   API endpoint for upload (default: http://localhost:3000)
 
   SCHEDULER (install / uninstall / status):
     Linux: Creates systemd user service + timer units at
@@ -303,9 +326,22 @@ async function cmdStatus(): Promise<void> {
   console.log(`    Data dir: ${dataDir}`);
   console.log(`      ${dataExists ? "EXISTS" : "NOT FOUND"}`);
 
+  // ── Spool health ───────────────────────────────────────────────
+  const spoolHealth = getSpoolHealth();
+  console.log(`  Spool:`);
+  console.log(`    Entries:     ${spoolHealth.entryCount}`);
+  console.log(`    Total size:  ${(spoolHealth.totalSizeBytes / 1024).toFixed(1)} KB`);
+  if (spoolHealth.oldestEntryAt) {
+    const oldestAgeHours = (spoolHealth.oldestAgeMs / (1000 * 60 * 60)).toFixed(1);
+    console.log(`    Oldest age:  ${oldestAgeHours} hours (${spoolHealth.oldestEntryAt})`);
+  } else {
+    console.log(`    Oldest age:  N/A (empty)`);
+  }
+  console.log(`    Healthy:     ${spoolHealth.healthy ? "YES" : "NO (over limit)"}`);
+
   if (!timerExists && !serviceExists) {
     console.log("\n  Status: NOT INSTALLED");
-    console.log("  Run \`ega-devtrack install\` to set up the scheduler.\n");
+    console.log("  Run `ega-devtrack install` to set up the scheduler.\n");
     process.exit(0);
   }
 
@@ -381,9 +417,8 @@ async function cmdStatus(): Promise<void> {
   console.log("");
 
   // ── Caveat ───────────────────────────────────────────────────
-  console.log("  NOTE: The 'once' command currently requires --dry-run,");
-  console.log("  so scheduled runs log data but do not upload.");
-  console.log("  Check \`journalctl --user -u ega-devtrack.service\` for logs.\n");
+  console.log("  Upload mode: `ega-devtrack once --upload` sends data to the server.");
+  console.log("  Check `journalctl --user -u ega-devtrack.service` for logs.\n");
 }
 
 // ── Main dispatch ────────────────────────────────────────────────────
@@ -418,34 +453,135 @@ async function main(): Promise<void> {
 
   if (command === "once") {
     const isDryRun = args.includes("--dry-run");
+    const isUpload = args.includes("--upload");
 
-    if (!isDryRun) {
+    if (!isDryRun && !isUpload) {
       console.error(
-        "ERROR: The 'once' command requires --dry-run until upload mode is implemented.\n" +
-        "Run: ega-devtrack once --dry-run",
+        "ERROR: The 'once' command requires either --dry-run or --upload.\n" +
+        "  Run: ega-devtrack once --dry-run  (preview only, no upload)\n" +
+        "  Run: ega-devtrack once --upload   (collect + upload to server)",
       );
       process.exit(1);
     }
 
-    // ── Dry Run Mode ───────────────────────────────────────
-    const result = await runAllCollectors();
+    if (isDryRun) {
+      // ── Dry Run Mode ───────────────────────────────────────
+      const result = await runAllCollectors();
 
-    const output = {
-      dryRun: true,
-      timestamp: new Date().toISOString(),
-      payload: result.payload,
-      collectors: {
-        run: result.collectorsRun,
-        failed: result.collectorsFailed,
-      },
-      errors: result.errors.length > 0 ? result.errors : undefined,
-      notice: "DRY RUN — No data was uploaded. All values have been sanitized.",
-    };
+      const output = {
+        dryRun: true,
+        timestamp: new Date().toISOString(),
+        payload: result.payload,
+        collectors: {
+          run: result.collectorsRun,
+          failed: result.collectorsFailed,
+        },
+        errors: result.errors.length > 0 ? result.errors : undefined,
+        notice: "DRY RUN — No data was uploaded. All values have been sanitized.",
+      };
 
-    console.log(JSON.stringify(output, null, 2));
+      console.log(JSON.stringify(output, null, 2));
 
-    // Dry-run always exits 0 — even when collectors fail
-    process.exit(0);
+      // Dry-run always exits 0 — even when collectors fail
+      process.exit(0);
+    }
+
+    // ── Upload Mode ──────────────────────────────────────────
+    const apiBaseUrl = process.env.DEVTRAK_API_URL ?? "http://localhost:3000";
+    const uploadUrl = `${apiBaseUrl.replace(/\/+$/, "")}/api/ingest`;
+
+    console.log(`[agent] Upload mode — endpoint: ${uploadUrl}`);
+
+    // Step 1: Retry spooled items (oldest first)
+    const spooledEntries = readSpool();
+    if (spooledEntries.length > 0) {
+      console.log(`[agent] Retrying ${spooledEntries.length} spooled upload(s)...`);
+      for (const entry of spooledEntries) {
+        try {
+          const response = await fetch(uploadUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(entry.payload),
+          });
+
+          if (response.ok) {
+            console.log(`[agent] Spool retry SUCCESS: ${entry.id}`);
+            deleteSpoolEntry(entry.id);
+          } else {
+            const text = await response.text().catch(() => "unknown");
+            console.warn(`[agent] Spool retry FAILED (HTTP ${response.status}): ${entry.id} — ${text}`);
+            // Update retry count in the file
+            entry.retryCount++;
+            entry.lastRetryAt = new Date().toISOString();
+            const updatedEntry = {
+              ...entry,
+              lastRetryAt: new Date().toISOString(),
+              retryCount: entry.retryCount,
+            };
+            const { join } = await import("node:path");
+            const { homedir } = await import("node:os");
+            const spoolDir = join(homedir(), ".local", "share", "ega-devtrack", "spool");
+            const { writeFileSync } = await import("node:fs");
+            writeFileSync(join(spoolDir, `${entry.id}.json`), JSON.stringify(updatedEntry, null, 2), "utf-8");
+          }
+        } catch (err) {
+          console.warn(`[agent] Spool retry ERROR: ${entry.id} — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    } else {
+      console.log("[agent] No spooled items to retry.");
+    }
+
+    // Step 2: Collect fresh data
+    const collectorResult = await runAllCollectors();
+    console.log(
+      `[agent] Collected data: ${collectorResult.collectorsRun} collectors run, ${collectorResult.collectorsFailed} failed`,
+    );
+
+    for (const err of collectorResult.errors) {
+      console.warn(`[agent] Collector error: ${err}`);
+    }
+
+    // Step 3: Upload fresh payload
+    try {
+      const response = await fetch(uploadUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(collectorResult.payload),
+      });
+
+      if (response.ok) {
+        console.log("[agent] Upload SUCCESS");
+        console.log(JSON.stringify({ uploaded: true, timestamp: new Date().toISOString() }, null, 2));
+        process.exit(0);
+      } else {
+        const text = await response.text().catch(() => "unknown");
+        console.warn(`[agent] Upload FAILED (HTTP ${response.status}): ${text}`);
+
+        // Spool the failed payload for later retry
+        const spoolId = writeSpool(collectorResult.payload);
+        if (spoolId) {
+          console.log(`[agent] Payload spooled as: ${spoolId}`);
+        } else {
+          console.warn("[agent] Failed to spool payload (spool may be full)");
+        }
+
+        process.exit(1);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[agent] Upload NETWORK ERROR: ${message}`);
+
+      // Spool the failed payload for later retry
+      const spoolId = writeSpool(collectorResult.payload);
+      if (spoolId) {
+        console.log(`[agent] Payload spooled as: ${spoolId}`);
+      } else {
+        console.warn("[agent] Failed to spool payload (spool may be full)");
+      }
+
+      process.exit(1);
+    }
   }
 
   // Unknown command
