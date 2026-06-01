@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   Card,
   CardContent,
@@ -15,6 +16,17 @@ import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -32,6 +44,8 @@ type QuotaPoolWithUsage = {
     windowEnd: string;
     lastUpdatedAt: string;
   } | null;
+  source?: string;
+  confidence?: string;
 };
 
 type WorkspaceInfo = {
@@ -100,11 +114,15 @@ function confidenceBadge(pool: QuotaPoolWithUsage) {
   if (!pool.usageCurrent) {
     return <Badge variant="ghost">No data</Badge>;
   }
+  if (pool.source === "manual" || pool.confidence === "0.700") {
+    return <Badge variant="secondary">Manual</Badge>;
+  }
   return <Badge variant="default">Confirmed</Badge>;
 }
 
 function sourceLabel(pool: QuotaPoolWithUsage): string {
   if (!pool.usageCurrent) return "—";
+  if (pool.source === "manual") return "Manual";
   return "System";
 }
 
@@ -297,6 +315,8 @@ function PoolCard({ pool }: { pool: QuotaPoolWithUsage }) {
         {hasUsage && (
           <p className="text-sm text-muted-foreground">{usageLabel(pool)}</p>
         )}
+
+        <RecordManualUsageDialog pool={pool} />
       </CardContent>
 
       <CardFooter className="flex items-center justify-between text-xs text-muted-foreground">
@@ -311,6 +331,202 @@ function PoolCard({ pool }: { pool: QuotaPoolWithUsage }) {
         </div>
       </CardFooter>
     </Card>
+  );
+}
+
+// ── Device Card ────────────────────────────────────────────────
+
+function RecordManualUsageDialog({ pool }: { pool: QuotaPoolWithUsage }) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [usageAmount, setUsageAmount] = useState("");
+  const [description, setDescription] = useState("");
+  const [resetTime, setResetTime] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<{
+    usageAmount: string;
+    usagePercentage: number;
+  } | null>(null);
+
+  const totalAlloc = Number(pool.totalAllocated);
+
+  const handleSubmit = async () => {
+    const amount = Number(usageAmount);
+    if (isNaN(amount)) return;
+
+    if (amount < 0) {
+      setError("Usage amount cannot be negative");
+      return;
+    }
+    if (amount > totalAlloc) {
+      setError(`Usage amount (${amount}) exceeds total allocated (${totalAlloc})`);
+      return;
+    }
+
+    setSubmitting(true);
+    setError(null);
+
+    try {
+      const res = await fetch(`/api/workspaces/${pool.workspaceId}/manual-usage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          quotaPoolId: pool.id,
+          usageAmount: amount,
+          description: description || undefined,
+          resetTime: resetTime ? new Date(resetTime).toISOString() : undefined,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        const detailMsg = data.details?.[0]?.message ?? data.error ?? "Unknown error";
+        throw new Error(detailMsg);
+      }
+
+      setSuccess({
+        usageAmount: data.quotaPool.usageAmount,
+        usagePercentage: data.quotaPool.usagePercentage,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Submission failed");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleClose = () => {
+    setOpen(false);
+    setUsageAmount("");
+    setDescription("");
+    setResetTime("");
+    setError(null);
+    setSuccess(null);
+    router.refresh();
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger render={<Button variant="outline" size="sm" className="w-full" />}>
+        <svg
+          className="mr-1 h-4 w-4"
+          fill="none"
+          viewBox="0 0 24 24"
+          strokeWidth={1.5}
+          stroke="currentColor"
+        >
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182"
+          />
+        </svg>
+        Record Manual Usage
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Record Manual Usage</DialogTitle>
+          <DialogDescription>
+            Record usage for <span className="font-medium">{pool.displayName}</span>
+          </DialogDescription>
+        </DialogHeader>
+
+        {success ? (
+          <div className="space-y-3 py-2">
+            <div className="rounded-lg bg-green-500/10 p-3">
+              <p className="text-sm font-medium text-green-600 dark:text-green-400">
+                Usage recorded successfully
+              </p>
+            </div>
+            <div className="rounded-lg bg-muted p-3 space-y-1.5">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">Usage</span>
+                <span className="font-medium">{success.usageAmount} ({success.usagePercentage}%)</span>
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">Source</span>
+                <Badge variant="secondary">Manual</Badge>
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">Confidence</span>
+                <Badge variant="outline">70%</Badge>
+              </div>
+            </div>
+            <DialogFooter>
+              <Button onClick={handleClose}>Done</Button>
+            </DialogFooter>
+          </div>
+        ) : (
+          <div className="space-y-4 py-2">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Badge variant="secondary">{kindLabel(pool.kind)}</Badge>
+              <span>Total: {pool.totalAllocated}</span>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="manual-amount">Usage Amount</Label>
+              <Input
+                id="manual-amount"
+                type="number"
+                step="0.01"
+                min="0"
+                max={totalAlloc}
+                placeholder={`0 to ${totalAlloc}`}
+                value={usageAmount}
+                onChange={(e) => setUsageAmount(e.target.value)}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="manual-desc">Description (optional)</Label>
+              <Input
+                id="manual-desc"
+                type="text"
+                placeholder="e.g. Weekly usage report"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                maxLength={500}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="manual-reset">Reset Time (optional)</Label>
+              <Input
+                id="manual-reset"
+                type="datetime-local"
+                value={resetTime}
+                onChange={(e) => setResetTime(e.target.value)}
+              />
+            </div>
+
+            {error && (
+              <div className="rounded-lg bg-destructive/10 p-2.5">
+                <p className="text-xs text-destructive">{error}</p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {!success && (
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleSubmit}
+              disabled={submitting || !usageAmount || isNaN(Number(usageAmount))}
+            >
+              {submitting ? "Submitting..." : "Record"}
+            </Button>
+          </DialogFooter>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 
