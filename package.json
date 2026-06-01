@@ -11,7 +11,10 @@
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
     "db:seed": "tsx --env-file=.env.local scripts/seed.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "agent:dry-run": "node scripts/ega-devtrack.js once --dry-run",
+    "agent:privacy-report": "node scripts/ega-devtrack.js privacy-report",
+    "agent:help": "node scripts/ega-devtrack.js --help"
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
