@@ -40,6 +40,12 @@ export const UPLOADED_FIELDS = [
   { field: "codex model name", description: "Model name from config.toml (e.g. gpt-5.5) — used to classify paid vs free pool" },
   { field: "codex tool type", description: "Tool type identifier 'codex' for the Codex CLI" },
   { field: "codex detection status", description: "Whether Codex CLI and config.toml were detected on the machine" },
+
+  // OpenCode-specific fields (from opencode models output — model names only)
+  { field: "opencode models list", description: "Model names from `opencode models` — used to detect provider prefixes (opencode-go/, openai/, opencode/)" },
+  { field: "opencode detected providers", description: "Unique provider prefixes parsed from model names (e.g. opencode-go, openai, google, openrouter)" },
+  { field: "opencode classified pool", description: "Quota pool assignment based on detected providers (OpenCode Go, OpenAI Provider, Free, Unknown)" },
+  { field: "opencode models count", description: "Total number of available models (numeric only)" },
 ];
 
 // ── Fields That Are NEVER Uploaded ────────────────────────────
