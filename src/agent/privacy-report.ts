@@ -46,6 +46,12 @@ export const UPLOADED_FIELDS = [
   { field: "opencode detected providers", description: "Unique provider prefixes parsed from model names (e.g. opencode-go, openai, google, openrouter)" },
   { field: "opencode classified pool", description: "Quota pool assignment based on detected providers (OpenCode Go, OpenAI Provider, Free, Unknown)" },
   { field: "opencode models count", description: "Total number of available models (numeric only)" },
+
+  // Hermes-specific fields (from ~/.hermes/config.yaml — provider and model only)
+  { field: "hermes provider", description: "Provider name from config.yaml delegation section (e.g. opencode-go, openrouter, openai)" },
+  { field: "hermes model", description: "Model name from config.yaml delegation section (e.g. deepseek-v4-flash, gpt-4o)" },
+  { field: "hermes classified pool", description: "Quota pool assignment based on provider/model mapping (OpenCode Go, OpenAI Provider, Free, Unknown)" },
+  { field: "hermes detection status", description: "Whether Hermes config.yaml was detected on the machine" },
 ];
 
 // ── Fields That Are NEVER Uploaded ────────────────────────────
