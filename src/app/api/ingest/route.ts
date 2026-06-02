@@ -11,6 +11,7 @@ import {
 } from "@/lib/db/schema";
 import { validateDeviceToken } from "@/lib/devices";
 import { eq, and, sql } from "drizzle-orm";
+import { serializeDbError, normalizeSnapshot, findInvalidUUIDs } from "@/lib/ingest-normalize";
 
 // ── Zod Schemas ────────────────────────────────────────────────
 
@@ -107,12 +108,36 @@ export async function POST(request: NextRequest) {
 
     const payload = parseResult.data;
 
-    // ── Validate device fingerprint matches ─────────────────
+    // ── Validate device fingerprint ─────────────────────────
     if (payload.device.deviceFingerprint.length === 0) {
       return NextResponse.json(
         { error: "device.deviceFingerprint is required" },
         { status: 400 },
       );
+    }
+
+    // ── Pre-validate all UUIDs ──────────────────────────────
+    const allPoolIds = [
+      ...payload.quotaPoolSnapshots.map((s) => s.quotaPoolId),
+      ...payload.toolQuotaAttributions.map((a) => a.quotaPoolId),
+    ];
+    const badUuids = findInvalidUUIDs(allPoolIds);
+    if (badUuids.length > 0) {
+      return NextResponse.json(
+        { error: `Invalid UUID values: ${badUuids.join(", ")}` },
+        { status: 400 },
+      );
+    }
+
+    // ── Normalize numeric values ────────────────────────────
+    for (const snap of payload.quotaPoolSnapshots) {
+      const normalized = normalizeSnapshot(snap);
+      if (typeof normalized === "string") {
+        return NextResponse.json({ error: normalized }, { status: 400 });
+      }
+      // Mutate in place with string values for the DB
+      (snap as Record<string, unknown>).usageAmount = normalized.usageAmount;
+      (snap as Record<string, unknown>).confidence = normalized.confidence;
     }
 
     // ── Begin Transaction ────────────────────────────────────
@@ -364,7 +389,16 @@ export async function POST(request: NextRequest) {
     }
     const message =
       error instanceof Error ? error.message : "Internal server error";
-    return NextResponse.json({ error: message }, { status: 500 });
+    const dbErr = serializeDbError(error);
+    return NextResponse.json(
+      {
+        error: message,
+        ...(process.env.DEBUG_INGEST_ERRORS === "true"
+          ? { db: dbErr }
+          : { db: { code: dbErr.code, detail: dbErr.detail, constraint: dbErr.constraint, table: dbErr.table } }),
+      },
+      { status: 500 },
+    );
   }
 }
 
