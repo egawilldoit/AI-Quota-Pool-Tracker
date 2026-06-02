@@ -47,9 +47,6 @@ function showHelp(): void {
     ega-devtrack register --token TOKEN  Register this device with server
     ega-devtrack once --dry-run         Collect & print normalized payload (no upload)
     ega-devtrack once --upload          Collect, upload to server, retry spooled items
-    ega-devtrack opencode-go manual     Enter OpenCode Go usage from screenshot values
-      --rolling-used-pct N --weekly-used-pct N --monthly-used-pct N
-      [--rolling-reset TEXT] [--weekly-reset TEXT] [--monthly-reset TEXT]
     ega-devtrack privacy-report         Print privacy report
     ega-devtrack install                Install systemd timer (runs every 15 min)
     ega-devtrack uninstall              Remove installed systemd timer & service
@@ -71,8 +68,6 @@ function showHelp(): void {
   ENVIRONMENT:
     DEVTRAK_API_URL   API endpoint for upload (default: http://localhost:3000)
     DEVTRAK_DEVICE_TOKEN  Optional device token override for upload auth
-    DEVTRACK_EXPERIMENTAL_CODEX_DASHBOARD=1  Enable Codex Analytics scraping (experimental)
-    DEVTRACK_EXPERIMENTAL_OPENCODE_GO_USAGE=1  Enable OpenCode Go workspace scraping (experimental)
 
   SCHEDULER (install / uninstall / status):
     Linux: Creates systemd user service + timer units at
@@ -598,7 +593,6 @@ async function cmdOpenCodeGoManual(): Promise<void> {
 
   if (!rollingUsed || !weeklyUsed || !monthlyUsed) {
     console.error("ERROR: --rolling-used-pct, --weekly-used-pct, and --monthly-used-pct are required.");
-    console.error("  Example: ega-devtrack opencode-go manual --rolling-used-pct 3 --weekly-used-pct 5 --monthly-used-pct 14");
     process.exit(1);
   }
 
@@ -616,43 +610,27 @@ async function cmdOpenCodeGoManual(): Promise<void> {
   }
 
   const { buildOpenCodeGoManualSnapshots } = await import("../src/agent/collectors/opencode");
-
   const config = readAgentConfig();
   const snapshots = buildOpenCodeGoManualSnapshots({
-    rollingUsedPct: rolling,
-    weeklyUsedPct: weekly,
-    monthlyUsedPct: monthly,
-    rollingReset,
-    weeklyReset,
-    monthlyReset,
+    rollingUsedPct: rolling, weeklyUsedPct: weekly, monthlyUsedPct: monthly,
+    rollingReset, weeklyReset, monthlyReset,
   });
 
   const deviceFingerprint = config.deviceFingerprint ?? deriveDeviceFingerprint(getDeviceName(), process.platform);
   const { sanitize } = await import("../src/agent/sanitizer");
 
   const payload = sanitize({
-    device: {
-      deviceFingerprint,
-      agentVersion: "0.1.0",
-      os: process.platform,
-    },
+    device: { deviceFingerprint, agentVersion: "0.1.0", os: process.platform },
     quotaPoolSnapshots: snapshots,
     toolQuotaAttributions: [],
-    toolInfos: [
-      {
-        toolType: "opencode",
-        displayName: "OpenCode CLI (OpenCode Go)",
-        agentFingerprint: `opencode-opencode-go-manual-${deviceFingerprint.slice(0, 8)}`,
-        metadata: JSON.stringify({
-          usageStatus: "manual_confirmed",
-          pool: "OpenCode Go",
-          manualSource: "screenshot",
-        }),
-      },
-    ],
+    toolInfos: [{
+      toolType: "opencode",
+      displayName: "OpenCode CLI (OpenCode Go)",
+      agentFingerprint: `opencode-opencode-go-manual-${deviceFingerprint.slice(0, 8)}`,
+      metadata: JSON.stringify({ usageStatus: "manual_confirmed", pool: "OpenCode Go", manualSource: "screenshot" }),
+    }],
   });
 
-  // Upload directly
   const deviceToken = getDeviceToken(config);
   if (!deviceToken) {
     console.error("ERROR: Device not registered. Run: ega-devtrack register --token <bootstrap-token>");
@@ -663,25 +641,16 @@ async function cmdOpenCodeGoManual(): Promise<void> {
   const uploadUrl = `${apiBaseUrl}/api/ingest`;
 
   console.log(`[agent] Uploading OpenCode Go manual usage to: ${uploadUrl}`);
-  console.log(JSON.stringify({
-    windows: snapshots.map((s) => ({
-      window: s.windowName,
-      usedPct: s.usageAmount,
-      source: s.source,
-      confidence: s.confidence,
-    })),
-  }, null, 2));
+  for (const s of snapshots) {
+    console.log(`  ${s.windowName}: ${s.usageAmount}% (source: ${s.source}, confidence: ${s.confidence})`);
+  }
 
   try {
     const response = await fetch(uploadUrl, {
-      method: "POST",
-      headers: authHeaders(deviceToken),
-      body: JSON.stringify(payload),
+      method: "POST", headers: authHeaders(deviceToken), body: JSON.stringify(payload),
     });
-
     if (response.ok) {
       console.log("[agent] Manual OpenCode Go usage uploaded SUCCESS");
-      process.exit(0);
     } else {
       const text = await response.text().catch(() => "unknown");
       console.error(`[agent] Upload FAILED (HTTP ${response.status}): ${text}`);
@@ -691,6 +660,117 @@ async function cmdOpenCodeGoManual(): Promise<void> {
     console.error(`[agent] Upload NETWORK ERROR: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
   }
+}
+
+// ── Usage Collection (with experimental browser collectors) ──────
+
+async function cmdUsageCollect(): Promise<void> {
+  const subcommand = args[1];
+
+  if (subcommand !== "collect") {
+    console.error("ERROR: usage command requires 'collect' subcommand.");
+    console.error("  Usage: ega-devtrack usage collect --dry-run");
+    console.error("         ega-devtrack usage collect --upload");
+    process.exit(1);
+  }
+
+  const isDryRun = args.includes("--dry-run");
+  const isUpload = args.includes("--upload");
+
+  if (!isDryRun && !isUpload) {
+    console.error("ERROR: usage collect requires --dry-run or --upload.");
+    process.exit(1);
+  }
+
+  const config = readAgentConfig();
+
+  if (isDryRun) {
+    const result = await runAllCollectors({
+      deviceFingerprint: config.deviceFingerprint ?? deriveDeviceFingerprint(getDeviceName(), process.platform),
+      agentVersion: "0.1.0", os: process.platform,
+    });
+
+    printUsageSummary(result.payload.quotaPoolSnapshots);
+
+    console.log(JSON.stringify({
+      dryRun: true,
+      timestamp: new Date().toISOString(),
+      experimental: {
+        codexBrowser: process.env.DEVTRACK_EXPERIMENTAL_CODEX_BROWSER_USAGE === "1",
+        opencodeGoBrowser: process.env.DEVTRACK_EXPERIMENTAL_OPENCODE_GO_BROWSER_USAGE === "1",
+      },
+      collectors: { run: result.collectorsRun, failed: result.collectorsFailed },
+      errors: result.errors.length > 0 ? result.errors : undefined,
+      notice: "DRY RUN — No data was uploaded. Summary above is for preview only.",
+    }, null, 2));
+    process.exit(0);
+  }
+
+  // Upload mode
+  const deviceToken = getDeviceToken(config);
+  if (!deviceToken) {
+    console.error("ERROR: Device not registered.");
+    process.exit(1);
+  }
+
+  const apiBaseUrl = getApiBaseUrl(config);
+  const uploadUrl = `${apiBaseUrl}/api/ingest`;
+
+  const result = await runAllCollectors({
+    deviceFingerprint: config.deviceFingerprint ?? deriveDeviceFingerprint(getDeviceName(), process.platform),
+    agentVersion: "0.1.0", os: process.platform,
+  });
+
+  printUsageSummary(result.payload.quotaPoolSnapshots);
+
+  try {
+    const response = await fetch(uploadUrl, {
+      method: "POST", headers: authHeaders(deviceToken), body: JSON.stringify(result.payload),
+    });
+    if (response.ok) {
+      console.log("[agent] Usage upload SUCCESS");
+    } else {
+      const text = await response.text().catch(() => "unknown");
+      console.warn(`[agent] Upload FAILED (HTTP ${response.status}): ${text}`);
+      process.exit(1);
+    }
+  } catch (err) {
+    console.error(`[agent] Upload NETWORK ERROR: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+function printUsageSummary(snapshots: { windowName: string; usageAmount: number; source?: string; confidence?: number }[]): void {
+  console.log("\\n  === Usage Summary ===");
+
+  const codex = snapshots.filter((s) => s.windowName.startsWith("codex-"));
+  const opencode = snapshots.filter((s) => s.windowName.startsWith("opencode-go-"));
+
+  if (codex.length > 0) {
+    console.log("  Codex:");
+    for (const s of codex) {
+      const label = s.windowName.replace("codex-", "");
+      if (s.usageAmount < 0) {
+        console.log(`    ${label}: unknown (source: ${s.source ?? "—"})`);
+      } else {
+        console.log(`    ${label}: ${s.usageAmount}% used (source: ${s.source ?? "—"}, confidence: ${s.confidence ?? "—"})`);
+      }
+    }
+  }
+
+  if (opencode.length > 0) {
+    console.log("  OpenCode Go:");
+    for (const s of opencode) {
+      const label = s.windowName.replace("opencode-go-", "");
+      if (s.usageAmount < 0) {
+        console.log(`    ${label}: unknown (source: ${s.source ?? "—"})`);
+      } else {
+        console.log(`    ${label}: ${s.usageAmount}% used (source: ${s.source ?? "—"}, confidence: ${s.confidence ?? "—"})`);
+      }
+    }
+  }
+
+  console.log("");
 }
 
 // ── Main dispatch ────────────────────────────────────────────────────
@@ -730,6 +810,11 @@ async function main(): Promise<void> {
 
   if (command === "opencode-go") {
     await cmdOpenCodeGoManual();
+    process.exit(0);
+  }
+
+  if (command === "usage") {
+    await cmdUsageCollect();
     process.exit(0);
   }
 

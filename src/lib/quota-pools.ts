@@ -2,6 +2,7 @@ import { db } from "./db/client";
 import {
   quotaPools,
   usageCurrentState,
+  usageSnapshots,
   workspaces,
 } from "./db/schema";
 import { eq, desc } from "drizzle-orm";
@@ -29,9 +30,9 @@ export type QuotaPoolWithUsage = {
   rolloverCap: string | null;
   createdAt: Date;
   updatedAt: Date;
-  /** All usage windows for this pool (one per window_name). May be empty if no data. */
+  /** All usage windows (one per window_name). May be empty. */
   usageWindows: UsageWindow[];
-  /** Convenience: the most recently updated window, or null. Kept for backward compat. */
+  /** Most recently updated window, or null. Backward compat. */
   usageCurrent: UsageWindow | null;
 };
 
@@ -42,21 +43,16 @@ export type GetQuotaPoolsResponse = {
 
 // ── Data Access ────────────────────────────────────────────────
 
-/**
- * Fetch all quota pools with current usage state for a workspace.
- */
 export async function getQuotaPoolsForWorkspace(
   workspaceId: string,
 ): Promise<GetQuotaPoolsResponse> {
-  const [workspace] = await db
+  const [ws] = await db
     .select({ id: workspaces.id, name: workspaces.name, slug: workspaces.slug })
     .from(workspaces)
     .where(eq(workspaces.id, workspaceId))
     .limit(1);
 
-  if (!workspace) {
-    throw new Error(`Workspace not found: ${workspaceId}`);
-  }
+  if (!ws) throw new Error(`Workspace not found: ${workspaceId}`);
 
   const pools = await db
     .select()
@@ -64,65 +60,55 @@ export async function getQuotaPoolsForWorkspace(
     .where(eq(quotaPools.workspaceId, workspaceId))
     .orderBy(quotaPools.displayName);
 
-  // Get ALL usage windows for each pool (not just the latest)
   const poolIds = pools.map((p) => p.id);
-  const usageStates = poolIds.length > 0
-    ? await db
-        .select()
-        .from(usageCurrentState)
+
+  // Get ALL usage_current_state rows (not just latest per pool)
+  const states = poolIds.length > 0
+    ? await db.select().from(usageCurrentState)
         .where(eq(usageCurrentState.workspaceId, workspaceId))
         .orderBy(desc(usageCurrentState.lastUpdatedAt))
     : [];
 
-  // Also get the latest usage_snapshot per window to get source/confidence
-  const { usageSnapshots } = await import("./db/schema");
-  const snapshots = poolIds.length > 0
-    ? await db
-        .select({
-          quotaPoolId: usageSnapshots.quotaPoolId,
-          windowName: usageSnapshots.windowName,
-          source: usageSnapshots.source,
-          confidence: usageSnapshots.confidence,
-        })
-        .from(usageSnapshots)
+  // Get usage_snapshots for source/confidence metadata
+  const srcData = poolIds.length > 0
+    ? await db.select({
+        quotaPoolId: usageSnapshots.quotaPoolId,
+        windowName: usageSnapshots.windowName,
+        source: usageSnapshots.source,
+        confidence: usageSnapshots.confidence,
+      }).from(usageSnapshots)
         .where(eq(usageSnapshots.workspaceId, workspaceId))
         .orderBy(desc(usageSnapshots.capturedAt))
     : [];
 
-  // Build a map of latest source/confidence per (pool, window)
-  const sourceMap = new Map<string, { source: string | null; confidence: string | null }>();
-  for (const s of snapshots) {
+  // Source/confidence map: key = poolId::windowName
+  const srcMap = new Map<string, { source: string | null; confidence: string | null }>();
+  for (const s of srcData) {
     const key = `${s.quotaPoolId}::${s.windowName}`;
-    if (!sourceMap.has(key)) {
-      sourceMap.set(key, { source: s.source, confidence: s.confidence });
-    }
+    if (!srcMap.has(key)) srcMap.set(key, { source: s.source, confidence: s.confidence });
   }
 
-  // Group usage states by pool
-  const usageByPool = new Map<string, typeof usageStates>();
-  for (const state of usageStates) {
-    if (!usageByPool.has(state.quotaPoolId)) {
-      usageByPool.set(state.quotaPoolId, []);
-    }
-    usageByPool.get(state.quotaPoolId)!.push(state);
+  // Group current states by pool
+  const byPool = new Map<string, typeof states>();
+  for (const s of states) {
+    if (!byPool.has(s.quotaPoolId)) byPool.set(s.quotaPoolId, []);
+    byPool.get(s.quotaPoolId)!.push(s);
   }
 
   const poolsWithUsage: QuotaPoolWithUsage[] = pools.map((pool) => {
-    const windows = usageByPool.get(pool.id) ?? [];
+    const windows = byPool.get(pool.id) ?? [];
     const usageWindows: UsageWindow[] = windows.map((w) => {
-      const srcMeta = sourceMap.get(`${pool.id}::${w.windowName}`);
+      const meta = srcMap.get(`${pool.id}::${w.windowName}`);
       return {
         usageAmount: w.usageAmount,
         windowName: w.windowName,
         windowStart: w.windowStart,
         windowEnd: w.windowEnd,
         lastUpdatedAt: w.lastUpdatedAt,
-        source: srcMeta?.source ?? null,
-        confidence: srcMeta?.confidence ?? null,
+        source: meta?.source ?? null,
+        confidence: meta?.confidence ?? null,
       };
     });
-
-    // Sort windows alphabetically
     usageWindows.sort((a, b) => a.windowName.localeCompare(b.windowName));
 
     return {
@@ -141,5 +127,5 @@ export async function getQuotaPoolsForWorkspace(
     };
   });
 
-  return { pools: poolsWithUsage, workspace };
+  return { pools: poolsWithUsage, workspace: ws };
 }

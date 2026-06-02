@@ -1,29 +1,37 @@
 /**
  * Codex collector — detects local Codex CLI installation, reads safe model
- * metadata from ~/.codex/config.toml, and collects usage windows.
+ * metadata from ~/.codex/config.toml, and collects usage windows at multiple
+ * collection levels.
  *
- * COLLECTION PATHS (in priority order):
+ * COLLECTION LEVELS (in priority order):
  *
- * A. Safe CLI path — `codex status` (requires TTY, may not work in cron)
- *    Parses multi-window output:
- *      - 5 hour usage limit: XX% remaining → usedPct = 100 - remainingPct
- *      - weekly usage limit: XX% remaining → usedPct = 100 - remainingPct
- *      - credits remaining: N → usedPct = totalAllocated - N (if known)
- *    source = "codex_cli_status", confidence = "confirmed"
+ * 1. Safe detection / heartbeat — always runs
+ *    Reads ~/.codex/config.toml for model name only.
+ *    Emits detection windows with usageAmount=-1 (unknown).
+ *    source="detected", confidence=0.7–0.9
  *
- * B. Detection fallback — model name from config.toml (always works)
- *    source = "detected", confidence = 0.7–0.9 (based on model)
- *    Emits usage_unknown — the dashboard shows "unknown" not fake 0%.
+ * 2. CLI interactive / PTY parser — runs when TTY is available
+ *    Parses `codex status` output for multi-window usage:
+ *      - 5 hour usage limit: 54% remaining → 46% used
+ *      - weekly usage limit: 76% remaining → 24% used
+ *      - credits remaining: 0 of 1000
+ *    Converts remaining-to-used.
+ *    source="codex_cli_status", confidence=0.85
  *
- * C. Experimental dashboard path — gated by env flag:
- *    DEVTRACK_EXPERIMENTAL_CODEX_DASHBOARD=1
- *    (not implemented yet — browser auth path needs explicit opt-in)
+ * 3. Experimental browser dashboard collector — opt-in only
+ *    Flag: DEVTRACK_EXPERIMENTAL_CODEX_BROWSER_USAGE=1
+ *    Targets: https://chatgpt.com/codex/cloud/settings/analytics
+ *    Uses Playwright to read visible dashboard text only.
+ *    Extracts normalized usage percentages and reset times.
+ *    NEVER uploads cookies, auth tokens, full HTML, or any dashboard state.
+ *    source="codex_browser_dashboard", confidence=0.95
  *
  * PRIVACY SAFEGUARDS:
  *   - Reads ONLY ~/.codex/config.toml (model name only)
  *   - NEVER reads ~/.codex/auth.json (contains tokens)
- *   - NEVER uploads prompts, completions, source code, session contents,
- *     shell history, file names, auth tokens, API keys, or cookies.
+ *   - Runs only `codex status`; never sends prompts.
+ *   - Browser collector is disabled by default and requires explicit env flags.
+ *   - NEVER uploads cookies, auth tokens, browser state, or raw HTML.
  *   - All output is passed through sanitize() before returning.
  */
 import fs from "node:fs";
@@ -47,16 +55,20 @@ export interface CodexCollectorResult {
 /** Known paid-model prefixes that map to high-confidence usage. */
 const PAID_MODEL_PREFIXES = ["gpt-", "o1", "o3", "o4"];
 
+/** Sentinel: usage is unknown (not 0%!). Dashboard checks for < 0. */
+const USAGE_UNKNOWN = -1;
+
 // ── Types ─────────────────────────────────────────────────────
 
-interface CodexWindow {
-  windowName: string;
-  usedPct: number;
-  resetText?: string;
+interface CodexUsageWindow {
+  windowName: string;   // "5h", "weekly", "credits"
+  usedPct: number;       // 0-100 (percent used)
+  remainingPct?: number; // original remaining percentage
+  resetText?: string;    // e.g. "2026-06-03 02:51"
 }
 
-interface CodexStatusResult {
-  windows: CodexWindow[];
+interface CodexUsageResult {
+  windows: CodexUsageWindow[];
   source: string;
   confidence: number;
 }
@@ -101,12 +113,12 @@ function readCodexConfig(): { model: string; configDir: string } | null {
   }
 }
 
-// ── Codex Status Parsing ──────────────────────────────────────
+// ── Level 2: CLI / PTY Status Parser ─────────────────────────
 
 /**
- * Parse `codex status` text output for multi-window usage.
+ * Parse `codex status` multi-window text output.
  *
- * Expected format (Codex latest):
+ * Real output format (Codex latest, visible in TUI status bar):
  * ```
  * 5 hour usage limit
  * 54% remaining    2026-06-03 02:51
@@ -119,12 +131,12 @@ function readCodexConfig(): { model: string; configDir: string } | null {
  * ```
  *
  * Also handles older formats and locale variations.
+ * Exported for testing.
  */
-function parseCodexStatusMultiWindow(stdout: string): CodexWindow[] {
-  const windows: CodexWindow[] = [];
+export function parseCodexStatusMultiWindow(stdout: string): CodexUsageWindow[] {
+  const windows: CodexUsageWindow[] = [];
 
-  // Pattern: "5 hour usage limit" followed by a line with a percentage
-  // or "5h usage limit" or "5-hour usage limit"
+  // Split into sections separated by blank lines
   const sections = stdout.split(/\n{2,}/);
 
   for (const section of sections) {
@@ -135,7 +147,7 @@ function parseCodexStatusMultiWindow(stdout: string): CodexWindow[] {
 
     // Determine window type from header
     let windowName: string | null = null;
-    if (/5[-\s]?hour/i.test(headerLine) || /5h/i.test(headerLine)) {
+    if (/5[_\-\s]?hour/i.test(headerLine) || /5h/i.test(headerLine)) {
       windowName = "5h";
     } else if (/weekly/i.test(headerLine) || /week/i.test(headerLine)) {
       windowName = "weekly";
@@ -158,7 +170,11 @@ function parseCodexStatusMultiWindow(stdout: string): CodexWindow[] {
         const isRemaining = /remaining|left/i.test(pctMatch[2]);
         if (Number.isFinite(value)) {
           const usedPct = isRemaining ? Math.max(0, 100 - value) : value;
-          windows.push({ windowName, usedPct });
+          windows.push({
+            windowName,
+            usedPct,
+            remainingPct: isRemaining ? value : undefined,
+          });
           break;
         }
       }
@@ -175,12 +191,11 @@ function parseCodexStatusMultiWindow(stdout: string): CodexWindow[] {
             break;
           }
         }
-        // Try standalone number (credits remaining count)
+        // Try standalone remaining count
         const numMatch = line.match(/^(\d+(?:\.\d+)?)/);
         if (numMatch && !pctMatch) {
           const remaining = Number(numMatch[1]);
           if (Number.isFinite(remaining)) {
-            // We don't know total — store raw. Dashboard shows absolute.
             windows.push({ windowName, usedPct: remaining });
             break;
           }
@@ -188,10 +203,8 @@ function parseCodexStatusMultiWindow(stdout: string): CodexWindow[] {
       }
     }
 
-    // Try to extract reset time from the section
-    const resetMatch = section.match(
-      /(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})/,
-    );
+    // Try to extract reset timestamp
+    const resetMatch = section.match(/(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})/);
     if (resetMatch && windows.length > 0) {
       windows[windows.length - 1].resetText = resetMatch[1];
     }
@@ -201,20 +214,21 @@ function parseCodexStatusMultiWindow(stdout: string): CodexWindow[] {
 }
 
 /**
- * Try to collect usage via `codex status` (text output).
+ * Attempt to collect usage via `codex status` text output.
+ * Tries PTY wrappers first, then direct exec as fallback.
  */
-async function readCodexStatusUsage(): Promise<CodexStatusResult | null> {
+async function readCodexStatusUsage(): Promise<CodexUsageResult | null> {
   const options = {
-    timeout: 15_000,
+    timeout: 20_000,
     maxBuffer: 128 * 1024,
-    env: { ...process.env },
+    env: { ...process.env, TERM: "xterm-256color" },
   };
 
-  // Try PTY-less status first (may fail with "stdin is not a terminal")
+  // Try `script` wrapper (provides PTY on Linux)
   try {
     const result = await execFileAsync("script", [
       "-q", "-c", "codex status 2>/dev/null", "/dev/null",
-    ], { ...options, timeout: 20_000 });
+    ], options);
     const windows = parseCodexStatusMultiWindow(result.stdout);
     if (windows.length > 0) {
       return {
@@ -227,11 +241,9 @@ async function readCodexStatusUsage(): Promise<CodexStatusResult | null> {
     // script approach failed — try direct exec
   }
 
+  // Try direct exec (may fail with "stdin is not a terminal" in cron)
   try {
-    const result = await execFileAsync("codex", ["status"], {
-      ...options,
-      env: { ...process.env, TERM: "xterm-256color" },
-    });
+    const result = await execFileAsync("codex", ["status"], options);
     const windows = parseCodexStatusMultiWindow(result.stdout);
     if (windows.length > 0) {
       return {
@@ -247,11 +259,103 @@ async function readCodexStatusUsage(): Promise<CodexStatusResult | null> {
   return null;
 }
 
+// ── Level 3: Experimental Browser Dashboard Collector ────────
+
+function isExperimentalBrowserEnabled(): boolean {
+  return process.env.DEVTRACK_EXPERIMENTAL_CODEX_BROWSER_USAGE === "1";
+}
+
 /**
- * Check if the experimental dashboard flag is set.
+ * Check if Playwright is available as a local dependency.
  */
-function isExperimentalDashboardEnabled(): boolean {
-  return process.env.DEVTRACK_EXPERIMENTAL_CODEX_DASHBOARD === "1";
+function hasPlaywright(): boolean {
+  try {
+    require.resolve("playwright");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * NOTE: This function is a SKELETON. The actual browser dashboard scraping
+ * is not yet implemented here — it requires Playwright as a local dependency
+ * and user-configured browser auth. When enabled, it will:
+ *
+ * 1. Launch a headless browser (Playwright/Chromium)
+ * 2. Navigate to https://chatgpt.com/codex/cloud/settings/analytics
+ * 3. Extract visible usage text from the page DOM
+ * 4. Parse: 5h remaining%, weekly remaining%, credits remaining
+ * 5. Return ONLY normalized metadata (no cookies, no HTML, no auth)
+ *
+ * This collector is OFF by default (requires DEVTRACK_EXPERIMENTAL_CODEX_BROWSER_USAGE=1).
+ * It is NOT called from the scheduler or from `once --upload`.
+ * It IS called from `usage collect` when the flag is set.
+ *
+ * If Playwright is not installed or auth is not configured, it fails gracefully
+ * with a clear message about what's needed.
+ */
+async function collectBrowserUsage(): Promise<CodexUsageResult | null> {
+  if (!isExperimentalBrowserEnabled()) {
+    return null;
+  }
+
+  if (!hasPlaywright()) {
+    console.warn(
+      "[codex:browser] Experimental browser collector is enabled but Playwright is not installed.\n" +
+      "  Install with: npm install playwright\n" +
+      "  Then: npx playwright install chromium\n" +
+      "  Skipping browser collection.",
+    );
+    return null;
+  }
+
+  console.warn(
+    "[codex:browser] Experimental browser dashboard collector is ENABLED.\n" +
+    "  This will read usage from the Codex Analytics dashboard using a local browser.\n" +
+    "  Only normalized usage percentages and reset times are uploaded.\n" +
+    "  Cookies, auth tokens, and raw HTML are NEVER uploaded.\n" +
+    "  To disable: unset DEVTRACK_EXPERIMENTAL_CODEX_BROWSER_USAGE",
+  );
+
+  // --- Browser collection stub ---
+  // Full implementation requires:
+  // 1. Playwright: const { chromium } = await import("playwright");
+  // 2. Launch browser, navigate to dashboard, parse DOM
+  // 3. Extract usage text, parse with parseCodexDashboardText()
+  // 4. Return CodexUsageResult
+
+  console.warn(
+    "[codex:browser] Browser collection not yet fully implemented.\n" +
+    "  Use `codex status` from a TTY, or enter usage manually via the dashboard.",
+  );
+  return null;
+}
+
+/**
+ * Parse Codex Analytics dashboard page text (same format as status output).
+ * Used by the browser collector to extract windows from page content.
+ * Exported for testing.
+ */
+export function parseCodexDashboardText(htmlText: string): CodexUsageWindow[] {
+  // The dashboard text should contain the same "X% remaining" patterns
+  // Strip HTML tags and normalize whitespace (but preserve line breaks)
+  const plainText = htmlText
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#x27;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/[ \t]+/g, " ")
+    .split("\n")
+    .map((l) => l.trim())
+    .join("\n")
+    .trim();
+
+  return parseCodexStatusMultiWindow(plainText);
 }
 
 // ── Window Date Helpers ────────────────────────────────────────
@@ -265,7 +369,6 @@ function hourlyWindow(now: Date): { start: Date; end: Date } {
 }
 
 function weeklyWindow(now: Date): { start: Date; end: Date } {
-  // Monday of current week
   const start = new Date(now);
   const day = start.getDay();
   const diff = start.getDate() - day + (day === 0 ? -6 : 1);
@@ -282,11 +385,97 @@ function monthlyWindow(now: Date): { start: Date; end: Date } {
   return { start, end };
 }
 
+// ── Snapshot Builder ──────────────────────────────────────────
+
+function buildSnapshots(
+  windows: CodexUsageWindow[],
+  poolId: string,
+  source: string,
+  confidence: number,
+  now: Date,
+): QuotaPoolSnapshot[] {
+  return windows.map((w) => {
+    let windowStart: Date;
+    let windowEnd: Date;
+
+    switch (w.windowName) {
+      case "5h":
+        windowStart = hourlyWindow(now).start;
+        windowEnd = hourlyWindow(now).end;
+        break;
+      case "weekly":
+        windowStart = weeklyWindow(now).start;
+        windowEnd = weeklyWindow(now).end;
+        break;
+      case "monthly":
+      case "credits":
+        windowStart = monthlyWindow(now).start;
+        windowEnd = monthlyWindow(now).end;
+        break;
+      default:
+        windowStart = monthlyWindow(now).start;
+        windowEnd = monthlyWindow(now).end;
+    }
+
+    const dateKey = now.toISOString().slice(0, 13);
+
+    return {
+      quotaPoolId: poolId,
+      windowName: `codex-${w.windowName}`,
+      usageAmount: w.usedPct,
+      windowStart: windowStart.toISOString(),
+      windowEnd: windowEnd.toISOString(),
+      idempotencyKey: `codex-${poolId}-${w.windowName}-${source}-${dateKey}`,
+      source,
+      confidence,
+    };
+  });
+}
+
+function buildDetectionSnapshots(poolId: string, confidence: number, now: Date): QuotaPoolSnapshot[] {
+  const h5w = hourlyWindow(now);
+  const ww = weeklyWindow(now);
+  const mw = monthlyWindow(now);
+  const dateKey = now.toISOString().slice(0, 13);
+
+  return [
+    {
+      quotaPoolId: poolId,
+      windowName: "codex-5h",
+      usageAmount: USAGE_UNKNOWN,
+      windowStart: h5w.start.toISOString(),
+      windowEnd: h5w.end.toISOString(),
+      idempotencyKey: `codex-${poolId}-5h-detect-${dateKey}`,
+      source: "detected",
+      confidence,
+    },
+    {
+      quotaPoolId: poolId,
+      windowName: "codex-weekly",
+      usageAmount: USAGE_UNKNOWN,
+      windowStart: ww.start.toISOString(),
+      windowEnd: ww.end.toISOString(),
+      idempotencyKey: `codex-${poolId}-weekly-detect-${dateKey}`,
+      source: "detected",
+      confidence,
+    },
+    {
+      quotaPoolId: poolId,
+      windowName: "codex-credits",
+      usageAmount: USAGE_UNKNOWN,
+      windowStart: mw.start.toISOString(),
+      windowEnd: mw.end.toISOString(),
+      idempotencyKey: `codex-${poolId}-credits-detect-${dateKey}`,
+      source: "detected",
+      confidence,
+    },
+  ];
+}
+
 // ── Main Collector ─────────────────────────────────────────────
 
 export async function collectCodex(): Promise<CodexCollectorResult> {
   const now = new Date();
-
   const config = readCodexConfig();
 
   if (!config) {
@@ -307,98 +496,18 @@ export async function collectCodex(): Promise<CodexCollectorResult> {
 
   const { confidence: modelConfidence, poolId } = classifyModel(config.model);
 
-  // Attempt to collect real usage from codex status
-  const statusResult = await readCodexStatusUsage();
+  // Priority 1: Try CLI status (PTY)
+  let usageResult = await readCodexStatusUsage();
 
-  // Build window definitions
-  const h5w = hourlyWindow(now);
-  const ww = weeklyWindow(now);
-  const mw = monthlyWindow(now);
-
-  const snapshots: QuotaPoolSnapshot[] = [];
-
-  if (statusResult) {
-    // We have real usage windows from codex status
-    for (const window of statusResult.windows) {
-      let windowStart: Date;
-      let windowEnd: Date;
-
-      switch (window.windowName) {
-        case "5h":
-          windowStart = h5w.start;
-          windowEnd = h5w.end;
-          break;
-        case "weekly":
-          windowStart = ww.start;
-          windowEnd = ww.end;
-          break;
-        case "monthly":
-          windowStart = mw.start;
-          windowEnd = mw.end;
-          break;
-        case "credits":
-          windowStart = mw.start; // credits reset monthly-ish
-          windowEnd = mw.end;
-          break;
-        default:
-          windowStart = mw.start;
-          windowEnd = mw.end;
-      }
-
-      snapshots.push({
-        quotaPoolId: poolId,
-        windowName: `codex-${window.windowName}`,
-        usageAmount: window.usedPct,
-        windowStart: windowStart.toISOString(),
-        windowEnd: windowEnd.toISOString(),
-        idempotencyKey: `codex-${poolId}-${window.windowName}-${now.toISOString().slice(0, 13)}`,
-        source: statusResult.source,
-        confidence: statusResult.confidence,
-      });
-    }
-  } else {
-    // No real usage data available — emit detection-only snapshots with usage_unknown
-    // explicitly set to -1 to indicate "unknown" (not 0%)
-    const USAGE_UNKNOWN = -1;
-
-    // Always emit Codex detection windows so the dashboard knows Codex is installed
-    for (const windowName of ["5h", "weekly", "credits"]) {
-      let windowStart: Date;
-      let windowEnd: Date;
-
-      switch (windowName) {
-        case "5h":
-          windowStart = h5w.start;
-          windowEnd = h5w.end;
-          break;
-        case "weekly":
-          windowStart = ww.start;
-          windowEnd = ww.end;
-          break;
-        case "credits":
-          windowStart = mw.start;
-          windowEnd = mw.end;
-          break;
-        default:
-          windowStart = mw.start;
-          windowEnd = mw.end;
-      }
-
-      snapshots.push({
-        quotaPoolId: poolId,
-        windowName: `codex-${windowName}`,
-        usageAmount: USAGE_UNKNOWN,
-        windowStart: windowStart.toISOString(),
-        windowEnd: windowEnd.toISOString(),
-        idempotencyKey: `codex-${poolId}-${windowName}-detect-${now.toISOString().slice(0, 13)}`,
-        source: "detected",
-        confidence: modelConfidence,
-      });
-    }
+  // Priority 2: Try experimental browser (only if explicitly enabled)
+  if (!usageResult && isExperimentalBrowserEnabled()) {
+    usageResult = await collectBrowserUsage();
   }
 
-  const usageStatus = statusResult ? "codex_cli_status" : "detected";
-  const hasRealUsage = statusResult !== null;
+  // Build snapshots
+  const snapshots: QuotaPoolSnapshot[] = usageResult
+    ? buildSnapshots(usageResult.windows, poolId, usageResult.source, usageResult.confidence, now)
+    : buildDetectionSnapshots(poolId, modelConfidence, now);
 
   const toolInfos: ToolInfo[] = [
     {
@@ -408,9 +517,10 @@ export async function collectCodex(): Promise<CodexCollectorResult> {
       metadata: JSON.stringify({
         detected: true,
         model: config.model,
-        usageStatus,
-        hasRealUsage,
-        windows: statusResult?.windows.map((w) => w.windowName) ?? [],
+        usageSource: usageResult?.source ?? "detected",
+        hasRealUsage: !!usageResult,
+        windows: usageResult?.windows.map((w) => w.windowName) ?? [],
+        browserEnabled: isExperimentalBrowserEnabled(),
       }),
     },
   ];
@@ -418,16 +528,11 @@ export async function collectCodex(): Promise<CodexCollectorResult> {
   const rawMetadata: Record<string, unknown> = {
     model: config.model,
     toolType: "codex",
-    usageStatus,
-    hasRealUsage,
-    experimentalDashboardEnabled: isExperimentalDashboardEnabled(),
+    usageSource: usageResult?.source ?? "detected",
+    hasRealUsage: !!usageResult,
+    browserEnabled: isExperimentalBrowserEnabled(),
   };
 
-  const result: CodexCollectorResult = {
-    snapshots,
-    toolInfos,
-    rawMetadata,
-  };
-
+  const result: CodexCollectorResult = { snapshots, toolInfos, rawMetadata };
   return sanitize(result) as CodexCollectorResult;
 }

@@ -9,7 +9,7 @@
 
 1. [What Is a Quota Pool?](#what-is-a-quota-pool)
 2. [How Tools Are Tracked](#how-tools-are-tracked)
-   - [Detection vs. Usage Tracking](#detection-vs-usage-tracking)
+   - [Collection Levels](#collection-levels)
    - [Codex / ChatGPT](#codex--chatgpt)
    - [OpenCode Go](#opencode-go)
    - [Hermes Agent](#hermes-agent)
@@ -27,17 +27,18 @@
 5. [CLI Commands](#cli-commands)
    - [once --dry-run](#once---dry-run)
    - [once --upload](#once---upload)
+   - [usage collect](#usage-collect)
    - [opencode-go manual](#opencode-go-manual)
    - [privacy-report](#privacy-report)
-   - [install (Linux)](#install-linux)
-   - [install (Windows)](#install-windows)
-   - [uninstall](#uninstall)
-   - [status](#status)
-   - [npm Script Shortcuts](#npm-script-shortcuts)
-6. [Troubleshooting](#troubleshooting)
+   - [install / uninstall / status](#install-uninstall-status)
+6. [Dashboard](#dashboard)
+   - [Multi-Window Display](#multi-window-display)
+   - [Source Labels](#source-labels)
+   - [Stale Warnings](#stale-warnings)
+7. [Troubleshooting](#troubleshooting)
    - [Stale Device](#stale-device)
    - [Token Revoke / Rotate](#token-revoke--rotate)
-   - [Deferred Features](#deferred-features)
+   - [Known Limitations](#known-limitations)
 
 ---
 
@@ -54,293 +55,56 @@ The system supports these built-in pools:
 | `00000000-0000-0000-0000-000000000003`    | OpenAI Provider  | Usage via any tool configured with the `openai` provider       |
 | `00000000-0000-0000-0000-000000000004`    | Free / Unknown   | Usage via free-tier models or providers that could not be classified |
 
-You can create additional custom pools via the [dashboard](/dashboard) for any workspace.
-
 ---
 
 ## How Tools Are Tracked
 
-### Detection vs. Usage Tracking
+### Collection Levels
 
-The DevTrack agent operates at two levels:
+The DevTrack agent operates at three collection levels, in priority order:
 
-1. **Detection** — determines whether a tool is installed and which provider/model it uses. Detection runs automatically on every collector pass. The dashboard shows which tools are detected, but usage data is marked as "unknown" until real usage data arrives.
+| Level | Name | Description | Default |
+|-------|------|-------------|---------|
+| 1 | **Safe detection** | Reads only safe files (config.toml, opencode models output, config.yaml). Emits detection windows with usage = unknown (-1). | **Always enabled** |
+| 2 | **Manual entry** | User enters usage values via CLI commands or dashboard forms. | **On-demand** |
+| 3 | **Experimental browser** | Reads usage from local browser dashboard (Codex Analytics, OpenCode Go workspace). Opt-in only. | **Disabled by default** |
 
-2. **Usage tracking** — collects real usage percentages from the tool's own status/dashboard. Usage tracking requires the tool to expose a machine-readable status endpoint, or the user to enter values manually.
-
-When usage is unknown, the dashboard displays **"Usage unknown — run collector or enter manual usage"** instead of showing fake 0%.
+The dashboard shows **"Usage unknown — run collector or enter manual usage"** when usage is unknown. It never displays fake 0%.
 
 ### Codex / ChatGPT
 
-The agent detects Codex CLI by reading `~/.codex/config.toml` — specifically the top-level `model = "..."` field (e.g. `gpt-5.5`).
+#### Level 1 — Safe detection (always runs)
+- Reads `~/.codex/config.toml` → model name only
+- Classifies: `gpt-*`, `o1`, `o3`, `o4` → high-confidence paid (0.9)
+- Emits 3 detection windows: `codex-5h`, `codex-weekly`, `codex-credits`
+- All with `usageAmount=-1` (unknown), source: `detected`
 
-#### Collection paths (in priority order):
+#### Level 2 — CLI status (runs when TTY available)
+- `codex status` (via PTY wrapper) → parses multi-window output
+- Converts remaining-to-used: 54% remaining → 46% used
+- Windows: 5h, weekly, credits
+- Source: `codex_cli_status`, confidence: 0.85
+- **Limitation:** `codex status` requires TTY — won't work in cron/scheduler mode
 
-**A. Safe CLI path (`codex status`):**
-- Runs `codex status` via PTY to collect real usage windows
-- Parses multi-window output:
-  - 5 hour usage limit: `54% remaining` → **46% used**
-  - weekly usage limit: `76% remaining` → **24% used**
-  - credits remaining: `0 of 1000` → **0% used**
-- Source: `codex_cli_status`, confidence: `0.85`
-
-**B. Detection fallback:**
-- When `codex status` cannot run non-interactively (scheduled/cron mode)
-- Emits detection windows (5h, weekly, credits) with usage = unknown (-1)
-- Source: `detected`, confidence: model-based (0.7–0.9)
-- Dashboard shows "Usage unknown" message, not fake 0%
-
-**C. Experimental dashboard path (not yet implemented):**
-- Gated by env flag: `DEVTRACK_EXPERIMENTAL_CODEX_DASHBOARD=1`
-- Requires explicit user opt-in
-- Would scrape Codex Analytics page if auth is configured
-- Never enabled by default
-
-- **Model classification:** Models starting with `gpt-`, `o1`, `o3`, or `o4` are classified as **high-confidence paid** (confidence 0.9) and mapped to the **Codex-ChatGPT** pool.
-- **Privacy:** Only the model name is read. The agent **never** reads or uploads `~/.codex/auth.json` (contains tokens).
-- If Codex is not installed or config is missing, the agent records a `detected: false` ToolInfo and produces no snapshots.
+#### Level 3 — Experimental browser dashboard (opt-in)
+```bash
+DEVTRACK_EXPERIMENTAL_CODEX_BROWSER_USAGE=1
+```
+- Uses Playwright to read visible text from Codex Analytics dashboard
+- Extracts: 5h remaining%, weekly remaining%, credits remaining
+- Source: `codex_browser_dashboard`, confidence: 0.95
+- **NEVER uploads cookies, auth tokens, or raw HTML**
+- Requires: `npm install playwright && npx playwright install chromium`
 
 ### OpenCode Go
 
-The agent runs `opencode models` as a subprocess and parses the model list to detect the active provider. Usage collection currently requires manual entry.
-
-#### Collection paths:
-
-**A. Provider detection (automatic):**
-- `opencode models` → classifies by provider prefix
-  - Models prefixed `opencode-go/` → **OpenCode Go** pool (confidence 0.8)
-  - Models prefixed `openai/` → **OpenAI Provider** pool (confidence 0.7)
-  - Models prefixed `opencode/` → **Free** pool (confidence 0.5)
-- Emits detection windows (rolling, weekly, monthly) with usage = unknown (-1)
-
-**B. Manual entry (CLI):**
-- Enter usage values from the OpenCode Go workspace page
-- Command: `ega-devtrack opencode-go manual --rolling-used-pct N --weekly-used-pct N --monthly-used-pct N [--rolling-reset TEXT] [--weekly-reset TEXT] [--monthly-reset TEXT]`
-- Source: `manual_opencode_go`, confidence: `0.95`
-- Uploads directly to the server (no dry-run mode for manual entry)
-
-**C. Experimental browser path (not yet implemented):**
-- Gated by env flag: `DEVTRACK_EXPERIMENTAL_OPENCODE_GO_USAGE=1`
-- Requires workspace ID: `DEVTRACK_OPENCODE_WORKSPACE_ID=wrk_...`
-- Never enabled by default
-
-**OpenCode Go limitations:**
-- No official machine-readable usage API exists from OpenCode Go
-- `opencode models` does not expose usage data — only model/provider info
-- Manual entry is the primary path for accurate usage tracking
-- The [OpenCode Go workspace page](https://opencode.ai) shows usage visually but has no stable API
-
-- **Privacy:** Only the model names from `opencode models` are parsed. The agent **never** reads `auth.json`, `config.jsonc`, API keys, or any file containing tokens or secrets.
-- If `opencode` is not on `$PATH` or the command fails, the collector returns empty data gracefully.
-
-### Hermes Agent
-
-The agent reads `~/.hermes/config.yaml` to determine the active provider and model used by Hermes.
-
-- **Provider classification:**
-  - `provider: opencode-go` → **OpenCode Go** pool (confidence 0.8)
-  - `provider: openai` → **OpenAI Provider** pool (confidence 0.7)
-  - `provider: openrouter` with model starting `openai/` → **OpenAI Provider** pool (confidence 0.7)
-  - Model ending in `:free` → **Free** pool (confidence 0.5)
-  - All others → **Unknown** pool (confidence 0.3)
-- **Privacy:** Only the `provider` and `model` fields from the `delegation` or `model.default` section of `config.yaml` are extracted. The agent **never** reads `~/.hermes/.env` (contains API keys), memory files, session files, prompts, or completions.
-- **Usage:** Hermes provider/model routing is attributed to the matching pool. If Hermes routes through OpenCode Go, it is attributed to OpenCode Go. Usage amount remains unknown/manual unless the upstream provider exposes safe usage data.
-- If Hermes is not installed or config is missing, the agent records `detected: false` and produces no snapshots.
-
-### Manual Usage Fallback
-
-When the agent cannot reliably detect usage for a specific tool or provider:
-
-1. **For OpenCode Go:** Use `ega-devtrack opencode-go manual` CLI command (see above)
-2. **For other tools:** Navigate to **Dashboard** → select a workspace → **Manual Usage**
-3. URL pattern: `/workspaces/[workspaceId]/manual-usage/new`
-4. Enter the usage amount, select the quota pool, and optionally add a description.
-
-Manual entries are recorded with `source: "manual"` and full confidence (1.0).
-
----
-
-## Privacy & Data Boundary
-
-The DevTrack agent runs locally on your machine. It collects only what is necessary for quota tracking and **never** sends sensitive data to the server.
-
-### What the Agent Uploads
-
-These are the exact fields sent to the API endpoint (`POST /api/ingest`):
-
-#### Device Info
-| Field                          | Description                                                |
-|--------------------------------|------------------------------------------------------------|
-| `device.deviceFingerprint`     | Stable device identifier (hostname + OS hash, SHA-256)     |
-| `device.agentVersion`          | Agent software version string                              |
-| `device.os`                    | Operating system platform string (e.g. `linux`, `darwin`)  |
-
-#### Quota Pool Snapshots
-| Field                                        | Description                                           |
-|----------------------------------------------|-------------------------------------------------------|
-| `quotaPoolSnapshots[].quotaPoolId`           | UUID of the quota pool on the server                  |
-| `quotaPoolSnapshots[].windowName`            | Usage window label (e.g. `codex-5h`, `opencode-go-weekly`) |
-| `quotaPoolSnapshots[].usageAmount`           | Numeric usage amount (-1 = unknown)                   |
-| `quotaPoolSnapshots[].windowStart`           | ISO-8601 start of usage window                        |
-| `quotaPoolSnapshots[].windowEnd`             | ISO-8601 end of usage window                          |
-| `quotaPoolSnapshots[].idempotencyKey`        | Deduplication key                                     |
-| `quotaPoolSnapshots[].source`                | Source label (`codex_cli_status`, `detected`, `manual_opencode_go`, `heartbeat`, `manual`, `import`) |
-| `quotaPoolSnapshots[].confidence`            | Confidence score 0–1                                  |
-
-#### Tool Quota Attributions
-| Field                                            | Description                                    |
-|--------------------------------------------------|------------------------------------------------|
-| `toolQuotaAttributions[].toolInstanceFingerprint` | Tool fingerprint (matches `agentFingerprint`)  |
-| `toolQuotaAttributions[].quotaPoolId`            | UUID of the quota pool                         |
-| `toolQuotaAttributions[].allocatedAmount`        | Numeric allocated quota amount                 |
-
-#### Tool Info
-| Field                             | Description                                                  |
-|-----------------------------------|--------------------------------------------------------------|
-| `toolInfos[].toolType`            | AI tool type string (`codex`, `opencode`, `hermes`, etc.)    |
-| `toolInfos[].displayName`         | Human-readable display name                                  |
-| `toolInfos[].agentFingerprint`    | Stable tool instance identifier                              |
-| `toolInfos[].metadata`            | JSON blob (version, mode, model — **never** raw secrets)     |
-
-### What the Agent NEVER Uploads
-
-The following are **never collected, read, or uploaded**:
-
-| Category            | Description                                                       |
-|---------------------|-------------------------------------------------------------------|
-| API keys / tokens   | All raw API keys (`sk-*`, `tok_*`, `lin_api_*`, etc.) are redacted or never collected  |
-| Prompts / completions | Agent does not collect any prompt or completion text              |
-| Source code         | No source code files are read or uploaded                         |
-| Cookies             | Browser cookies are never accessed                                |
-| Auth files          | `~/.ssh/*`, `~/.config/*` credentials, `.env` files not collected |
-| Shell history       | `~/.bash_history`, `~/.zsh_history` never read                    |
-| Personal data       | No names, emails, addresses, or PII collected                     |
-| Private keys        | No SSH keys, GPG keys, or certificate private keys                |
-| Raw config files    | Config files may be examined for usage counts only; raw values redacted |
-| Device exact hostname | Fingerprints are hashed/derived, not raw hostnames              |
-| Network info        | No IP addresses, MAC addresses, or network topology               |
-| Browser cookies     | No browser cookies or session data ever uploaded                  |
-| API keys from tools | No Codex auth tokens, OpenCode Zen keys, or Hermes .env secrets   |
-
-### How Data Is Sanitized
-
-All collected data passes through a `sanitize()` function before being returned by any collector or written to the spool. This function:
-
-- Redacts anything that looks like an API key or token (`sk-*`, `tok_*`, `ghp_*`, etc.)
-- Redacts property names like `apiKey`, `token`, `authorization`, `password`, `bearer`, `auth`
-- Ensures no raw secrets leak into the payload output
-- Runs on both dry-run and upload mode
-
----
-
-## Setup Instructions
-
-### Prerequisites
-
-- **Node.js** 20+ and **npm**
-- **PostgreSQL** database (local or remote — Supabase recommended)
-- **systemd** (Linux only, for scheduler)
-- One of the tracked tools installed (optional): Codex CLI, OpenCode CLI, or Hermes Agent
-
-### Environment Variables
-
-Create a `.env.local` file in the project root:
-
-```env
-# Database (PostgreSQL via Supabase or direct connection)
-DATABASE_URL=postgresql://user:***@host:5432/dbname
-
-# Next.js
-NEXT_PUBLIC_SITE_URL=http://localhost:3000
-
-# Optional: DevTrack API (defaults to http://localhost:3000)
-DEVTRAK_API_URL=http://localhost:3000
-```
-
-If using Supabase, also configure the Supabase env vars if you use the Supabase client for auth:
-
-```env
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
-```
-
-### Supabase Setup
-
-1. Create a Supabase project at [supabase.com](https://supabase.com)
-2. In the SQL Editor, run the Drizzle migrations to create the tables
-3. Copy your project URL and anon key into `.env.local`
-
-### Drizzle Database Setup
-
-The project uses **Drizzle ORM** with PostgreSQL. Schema is defined in `src/lib/db/schema.ts`.
-
-```bash
-# Generate migration files
-npm run db:generate
-
-# Apply migrations to the database
-npm run db:migrate
-
-# (Optional) Seed demo data only. Do not run against production unless demo data is intended.
-npm run db:seed
-
-# (Optional) Open Drizzle Studio for inspecting data
-npm run db:studio
-```
-
-The schema includes these tables:
-
-- `workspaces` — Multi-tenant workspaces
-- `quota_pools` — Quota pools with allocation, rollover policy
-- `devices` — Registered devices (fingerprint-based)
-- `tool_instances` — AI tool/agent registrations
-- `tool_quota_attributions` — Links tools to pools with allocation amounts
-- `usage_snapshots` — Immutable usage records with idempotency keys
-- `usage_current_state` — Materialized current window states (fast-read), keyed by `workspace_id + quota_pool_id + window_name`
-- `agent_heartbeats` — Agent heartbeat log
-- `bootstrap_tokens` — Device registration tokens
-- `manual_usage_entries` — Manually entered usage records
-
-### Build the Agent
-
-```bash
-npm install
-npm run build
-```
-
-After building, the TypeScript CLI (`scripts/ega-devtrack.ts`) is compiled to `scripts/ega-devtrack.js` and ready to use directly or via npm scripts.
-
-### Production Agent Setup
-
-The dashboard cannot know local Codex/OpenCode/Hermes usage until a local agent is registered and uploads. Run these commands on the VM or local PC that has the tools/configs installed.
-
-1. Generate a bootstrap token in the dashboard:
-
-```text
-https://ai-quota-pool-tracker.vercel.app/devices/add
-```
-
-2. Register the device:
-
-```bash
-DEVTRAK_API_URL=https://ai-quota-pool-tracker.vercel.app \
-  node scripts/ega-devtrack.js register --token <bootstrap-token>
-```
-
-3. Preview normalized data locally. This uploads nothing.
-
-```bash
-node scripts/ega-devtrack.js once --dry-run
-```
-
-4. Upload one real payload.
-
-```bash
-node scripts/ega-devtrack.js once --upload
-```
-
-5. (Optional) Enter OpenCode Go usage from screenshot:
-
+#### Level 1 — Safe detection (always runs)
+- `opencode models` → detects provider prefix
+- `opencode-go/` → OpenCode Go pool (confidence 0.8)
+- Emits 3 detection windows: `opencode-go-rolling`, `opencode-go-weekly`, `opencode-go-monthly`
+- All with `usageAmount=-1` (unknown), source: `detected`
+
+#### Level 2 — Manual entry (CLI)
 ```bash
 DEVTRAK_API_URL=https://ai-quota-pool-tracker.vercel.app \
   node scripts/ega-devtrack.js opencode-go manual \
@@ -351,104 +115,159 @@ DEVTRAK_API_URL=https://ai-quota-pool-tracker.vercel.app \
     --weekly-reset "5 days 11 hours" \
     --monthly-reset "26 days 8 hours"
 ```
+- Source: `manual_opencode_go`, confidence: 0.95
+- Reset hints optional — used to compute window end times
 
-6. Install Linux scheduler if wanted.
-
+#### Level 3 — Experimental browser dashboard (opt-in)
 ```bash
-node scripts/ega-devtrack.js install
+DEVTRACK_EXPERIMENTAL_OPENCODE_GO_BROWSER_USAGE=1
+DEVTRACK_OPENCODE_GO_WORKSPACE_ID=wrk_...
 ```
+- Targets: `https://opencode.ai/workspace/<workspaceId>/go`
+- Extracts: Rolling Usage %, Weekly Usage %, Monthly Usage %, reset hints
+- Source: `opencode_go_browser_dashboard`, confidence: 0.95
+- Optional local config: `~/.local/share/ega-devtrack/opencode-go.json`
+  ```json
+  { "workspaceId": "wrk_...", "browserCollectorEnabled": true }
+  ```
 
-7. Verify dashboard.
+#### Why OpenCode Go automatic usage is limited
+OpenCode Go's workspace dashboard shows usage percentages visually (Rolling/Weekly/Monthly), but there is no documented stable public API for programmatic access. OpenCode issue #16017 requests this feature. Until a stable API exists, the browser collector path is experimental and the manual CLI path is the recommended way to enter accurate usage.
 
-```text
-https://ai-quota-pool-tracker.vercel.app/dashboard
-```
+#### Why Codex cron cannot rely on TTY /status
+`codex status` requires an interactive terminal (TTY/PTY). The cron scheduler runs as a systemd service without a TTY, so the status command fails with "stdin is not a terminal." The scheduler falls back to detection mode (Level 1), and accurate usage collection requires either a manual `codex status` run from a terminal or the experimental browser collector.
+
+### Hermes Agent
+
+Reads `~/.hermes/config.yaml` to determine the active provider and model.
+
+- **Provider classification:**
+  - `provider: opencode-go` → OpenCode Go pool (confidence 0.8)
+  - `provider: openai` → OpenAI Provider pool (confidence 0.7)
+  - `provider: openrouter` with model `openai/` → OpenAI Provider
+  - Model `:free` → Free pool (confidence 0.5)
+- Usage attributed to matching pool. Unknown unless upstream exposes safe usage data.
+
+### Manual Usage Fallback
+
+1. **For OpenCode Go:** `ega-devtrack opencode-go manual` CLI (see above)
+2. **For any pool:** Dashboard → pool card → "Record Manual Usage" button
+3. Or navigate to `/workspaces/[workspaceId]/manual-usage/new`
+
+---
+
+## Privacy & Data Boundary
+
+### What the Agent Uploads
+
+Normalized metadata only:
+- Device fingerprint (hashed), agent version, OS platform
+- Quota pool UUID, window name, usage amount (%), window boundaries
+- Source label, confidence score (0–1)
+- Tool type, display name, model name
+- Detection status (installed/detected or not)
+
+**Browser collector uploads ONLY:** normalized percentages and reset times. Never: cookies, auth tokens, full HTML, browser state, or any dashboard data beyond usage numbers.
+
+### What the Agent NEVER Uploads
+
+API keys/tokens, prompts/completions, source code, cookies, auth files, shell history, personal data, private keys, raw config files, device hostname (raw), network info, browser cookies, Codex auth tokens, OpenCode Zen keys, Hermes .env secrets.
+
+### How Data Is Sanitized
+
+All collected data passes through `sanitize()` which redacts: `sk-*`, `tok_*`, `ghp_*`, `gho_*`, `xox[bpar]-`, `AKIA*`, Slack tokens, and property names: `apiKey`, `api_key`, `token`, `authorization`, `password`, `bearer`, `auth`.
 
 ---
 
 ## CLI Commands
 
-All commands are run from the project root.
-
-### once --dry-run
+### once --dry-run / --upload
 
 ```bash
-node scripts/ega-devtrack.js once --dry-run
-# or
-npm run agent:dry-run
+npm run agent:dry-run     # Preview only, no upload
+npm run agent:upload      # Collect + upload + retry spool
 ```
 
-### once --upload
+### usage collect
+
+Collect usage from all safe + experimental collectors and display a summary:
 
 ```bash
-node scripts/ega-devtrack.js once --upload
-# or
-npm run agent:upload
+# Preview with experimental collectors
+DEVTRACK_EXPERIMENTAL_CODEX_BROWSER_USAGE=1 \
+  node scripts/ega-devtrack.js usage collect --dry-run
+
+# Upload with experimental collectors
+DEVTRACK_EXPERIMENTAL_CODEX_BROWSER_USAGE=1 \
+  node scripts/ega-devtrack.js usage collect --upload
+```
+
+Output example:
+```
+  === Usage Summary ===
+  Codex:
+    5h: 46% used (source: codex_cli_status, confidence: 0.85)
+    weekly: 24% used (source: codex_cli_status, confidence: 0.85)
+    credits: 0% used (source: codex_cli_status, confidence: 0.85)
+  OpenCode Go:
+    rolling: unknown (source: detected)
+    weekly: unknown (source: detected)
+    monthly: unknown (source: detected)
 ```
 
 ### opencode-go manual
 
-Enter OpenCode Go usage from the workspace dashboard values:
-
 ```bash
 DEVTRAK_API_URL=https://ai-quota-pool-tracker.vercel.app \
   node scripts/ega-devtrack.js opencode-go manual \
-    --rolling-used-pct N \
-    --weekly-used-pct N \
-    --monthly-used-pct N \
+    --rolling-used-pct N --weekly-used-pct N --monthly-used-pct N \
     [--rolling-reset "57 minutes"] \
     [--weekly-reset "5 days 11 hours"] \
     [--monthly-reset "26 days 8 hours"]
 ```
 
-- `--rolling-used-pct`, `--weekly-used-pct`, `--monthly-used-pct` are **required**
-- Reset hints are optional and used to compute window end times
-- Source: `manual_opencode_go`, confidence: `0.95`
-- Uploads directly — no dry-run mode
-
 ### privacy-report
 
 ```bash
-node scripts/ega-devtrack.js privacy-report
-# or
 npm run agent:privacy-report
 ```
 
-### install (Linux)
+### install / uninstall / status
 
 ```bash
-node scripts/ega-devtrack.js install
-# or
 npm run agent:install
-```
-
-### uninstall
-
-```bash
-node scripts/ega-devtrack.js uninstall
-# or
 npm run agent:uninstall
-```
-
-### status
-
-```bash
-node scripts/ega-devtrack.js status
-# or
 npm run agent:status
 ```
 
-### npm Script Shortcuts
+---
 
-| Command                        | Equivalent                                              |
-|--------------------------------|---------------------------------------------------------|
-| `npm run agent:dry-run`        | `node scripts/ega-devtrack.js once --dry-run`           |
-| `npm run agent:upload`         | `node scripts/ega-devtrack.js once --upload`            |
-| `npm run agent:privacy-report` | `node scripts/ega-devtrack.js privacy-report`           |
-| `npm run agent:help`           | `node scripts/ega-devtrack.js --help`                   |
-| `npm run agent:install`        | `node scripts/ega-devtrack.js install`                  |
-| `npm run agent:uninstall`      | `node scripts/ega-devtrack.js uninstall`                |
-| `npm run agent:status`         | `node scripts/ega-devtrack.js status`                   |
+## Dashboard
+
+### Multi-Window Display
+
+Each pool card now shows all usage windows (one per `window_name`):
+- **Codex:** 5h, weekly, credits
+- **OpenCode Go:** rolling, weekly, monthly
+
+Each window shows:
+- Usage percentage (or "Unknown" if data unavailable)
+- Source badge (CLI, Browser, Manual, Detected)
+- Confidence level (High/Med/Low)
+- Last updated time with stale indicator
+
+### Source Labels
+
+| Dashboard Label | Source Value | Meaning |
+|-----------------|-------------|---------|
+| CLI | `codex_cli_status`, `codex-status` | From `codex status` command |
+| Browser | `codex_browser_dashboard`, `opencode_go_browser_dashboard` | From experimental browser collector |
+| Manual | `manual_opencode_go`, `manual` | User-entered via CLI or form |
+| Detected | `detected`, `heartbeat` | Tool detected but usage unknown |
+
+### Stale Warnings
+
+A window is marked **Stale** when its `lastUpdatedAt` is older than 30 minutes. The dashboard shows a yellow "Stale" badge and the time since last update.
 
 ---
 
@@ -456,19 +275,14 @@ npm run agent:status
 
 ### Stale Device
 
-A device becomes **stale** when the server hasn't received a heartbeat or upload from it within the expected interval (15 minutes with the timer).
+A device becomes stale when no heartbeat/upload within 15 minutes. Dashboard shows "offline" on devices page.
 
-**Symptoms:**
-- Device shows "offline" on the devices page (`/devices`)
-- Dashboard shows "Usage unknown" for all pools
+### Known Limitations
 
-### Token Revoke / Rotate
-
-To rotate a device token: re-register the device. The old token is invalidated and a new one is generated.
-
-### Deferred Features
-
-- Windows Task Scheduler support (`ega-devtrack install` on Windows)
-- Experimental Codex Analytics dashboard scraping (`DEVTRACK_EXPERIMENTAL_CODEX_DASHBOARD=1`)
-- Experimental OpenCode Go workspace scraping (`DEVTRACK_EXPERIMENTAL_OPENCODE_GO_USAGE=1`)
-- Automated OpenCode Go usage collection (blocked on stable usage API from OpenCode Go)
+| Issue | Status |
+|-------|--------|
+| Codex status requires TTY — won't run in cron | Use experimental browser collector or manual entry |
+| OpenCode Go has no public usage API | Use manual CLI or experimental browser collector |
+| Playwright not bundled — manual install needed | `npm install playwright && npx playwright install chromium` |
+| Windows Task Scheduler not yet supported | Cross-platform planned |
+| Browser collectors are experimental skeletons | Full Playwright integration pending; manual CLI available now |

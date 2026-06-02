@@ -1,31 +1,44 @@
 /**
  * OpenCode collector — detects OpenCode installation and provider via
- * `opencode models`, and supports manual usage entry via CLI.
+ * `opencode models`, supports manual usage entry, and opt-in browser
+ * dashboard collection.
  *
- * COLLECTION PATHS:
+ * COLLECTION LEVELS:
  *
- * A. Provider detection — `opencode models` (always runs if opencode exists)
- *    Classifies provider prefix to determine quota pool.
- *    Usage remains unknown unless real usage data is available.
+ * 1. Safe detection (always runs)
+ *    Runs `opencode models` to detect provider/model.
+ *    Emits detection windows with usageAmount=-1 (unknown).
+ *    source="detected", confidence=0.3–0.8
  *
- * B. Manual usage entry — CLI subcommand:
- *    node scripts/ega-devtrack.js opencode-go manual \
- *      --rolling-used-pct 3 --weekly-used-pct 5 --monthly-used-pct 14 \
- *      --rolling-reset "57 minutes" --weekly-reset "5 days 11 hours" \
- *      --monthly-reset "26 days 8 hours"
- *    Creates snapshots with source="manual_opencode_go", confidence="manual_confirmed".
+ * 2. Manual usage entry (CLI subcommand)
+ *    `ega-devtrack opencode-go manual --rolling-used-pct N ...`
+ *    source="manual_opencode_go", confidence=0.95
  *
- * C. Experimental browser path — gated by env flag:
- *    DEVTRACK_EXPERIMENTAL_OPENCODE_GO_USAGE=1
- *    DEVTRACK_OPENCODE_WORKSPACE_ID=wrk_...
- *    (not implemented — needs explicit opt-in and local browser session)
+ * 3. Experimental browser dashboard collector — opt-in only
+ *    Flag: DEVTRACK_EXPERIMENTAL_OPENCODE_GO_BROWSER_USAGE=1
+ *    Workspace ID: DEVTRACK_OPENCODE_GO_WORKSPACE_ID=wrk_...
+ *    Targets: https://opencode.ai/workspace/<workspaceId>/go
+ *    Uses Playwright to read visible usage text from the page.
+ *    Extracts: Rolling Usage %, Weekly Usage %, Monthly Usage %
+ *    source="opencode_go_browser_dashboard", confidence=0.95
  *
- * PRIVACY: Only runs `opencode models`. NEVER reads auth.json, config.jsonc,
- * API keys, or any file containing tokens or secrets.
- * All output is sanitized via sanitize().
+ * 4. Local config path (optional)
+ *    ~/.local/share/ega-devtrack/opencode-go.json
+ *    Contains workspaceId and browser collector preference.
+ *    Git-ignored, never committed.
+ *
+ * PRIVACY:
+ * - Only runs `opencode models` (safe subprocess) — NEVER reads auth.json,
+ *   config.jsonc, API keys, or any file containing tokens or secrets.
+ * - Browser collector is disabled by default.
+ * - NEVER uploads cookies, auth tokens, browser state, or raw HTML.
+ * - All output is sanitized via sanitize().
  */
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { QuotaPoolSnapshot, ToolInfo } from "../payload";
 import { sanitize } from "../sanitizer";
 import { resolvePoolId } from "../pool-map";
@@ -52,6 +65,31 @@ export interface OpenCodeGoManualInput {
   rollingReset?: string;
   weeklyReset?: string;
   monthlyReset?: string;
+}
+
+// ── Local Config ──────────────────────────────────────────────
+
+interface OpenCodeGoLocalConfig {
+  workspaceId?: string;
+  browserCollectorEnabled?: boolean;
+}
+
+function localConfigPath(): string {
+  return path.join(
+    os.homedir(),
+    ".local", "share", "ega-devtrack",
+    "opencode-go.json",
+  );
+}
+
+function readLocalConfig(): OpenCodeGoLocalConfig {
+  try {
+    const fp = localConfigPath();
+    if (!fs.existsSync(fp)) return {};
+    return JSON.parse(fs.readFileSync(fp, "utf-8")) as OpenCodeGoLocalConfig;
+  } catch {
+    return {};
+  }
 }
 
 // ── Model Parsing ─────────────────────────────────────────────
@@ -112,7 +150,7 @@ function classifyPool(entries: OpenCodeModelEntry[]): {
 
 /**
  * Build usage snapshots from manually entered OpenCode Go usage values.
- * This is called from the CLI subcommand, not the automatic collector.
+ * Exported for CLI use.
  */
 export function buildOpenCodeGoManualSnapshots(
   input: OpenCodeGoManualInput,
@@ -128,17 +166,14 @@ export function buildOpenCodeGoManualSnapshots(
   ];
 
   return windows.map((w) => {
-    // Compute window boundaries based on reset text or defaults
     let windowStart: Date;
     let windowEnd: Date;
 
     if (w.reset) {
-      // Parse reset strings like "57 minutes", "5 days 11 hours", "26 days 8 hours"
       const resetMs = parseResetToMs(w.reset);
       windowEnd = new Date(now.getTime() + resetMs);
       windowStart = now;
     } else {
-      // Defaults: rolling=1h, weekly=7d, monthly=30d
       switch (w.name) {
         case "rolling":
           windowEnd = new Date(now.getTime() + 60 * 60 * 1000);
@@ -170,13 +205,12 @@ export function buildOpenCodeGoManualSnapshots(
 
 /**
  * Parse a human-readable reset duration into milliseconds.
- * Examples: "57 minutes", "5 days 11 hours", "26 days 8 hours", "2 hours"
+ * Examples: "57 minutes", "5 days 11 hours", "26 days 8 hours"
  */
-function parseResetToMs(reset: string): number {
+export function parseResetToMs(reset: string): number {
   let totalMs = 0;
   const lower = reset.toLowerCase();
 
-  // Match patterns like "5 days", "11 hours", "57 minutes"
   const dayMatch = lower.match(/(\d+)\s*day/);
   if (dayMatch) totalMs += Number(dayMatch[1]) * 24 * 60 * 60 * 1000;
 
@@ -189,14 +223,144 @@ function parseResetToMs(reset: string): number {
   const secMatch = lower.match(/(\d+)\s*sec/);
   if (secMatch) totalMs += Number(secMatch[1]) * 1000;
 
-  // Default: if nothing matched, return 24 hours
   return totalMs > 0 ? totalMs : 24 * 60 * 60 * 1000;
+}
+
+// ── Level 3: Browser Dashboard Collector ─────────────────────
+
+interface OpenCodeGoBrowserUsage {
+  rollingUsedPct: number;
+  weeklyUsedPct: number;
+  monthlyUsedPct: number;
+  rollingReset?: string;
+  weeklyReset?: string;
+  monthlyReset?: string;
+}
+
+function isExperimentalBrowserEnabled(): boolean {
+  return process.env.DEVTRACK_EXPERIMENTAL_OPENCODE_GO_BROWSER_USAGE === "1";
+}
+
+function getWorkspaceId(): string | null {
+  return process.env.DEVTRACK_OPENCODE_GO_WORKSPACE_ID
+    ?? readLocalConfig().workspaceId
+    ?? null;
+}
+
+function hasPlaywright(): boolean {
+  try {
+    require.resolve("playwright");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Parse OpenCode Go workspace dashboard text.
+ * Expected format (from opencode.ai workspace page):
+ * ```
+ * Rolling Usage 3%
+ * Weekly Usage 5%
+ * Monthly Usage 14%
+ * ```
+ * Also parses reset hints like "Resets in 57 minutes"
+ * Exported for testing.
+ */
+export function parseOpenCodeGoDashboardText(htmlText: string): OpenCodeGoBrowserUsage | null {
+  // Strip HTML and normalize
+  const plainText = htmlText
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#x27;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const rollingMatch = plainText.match(/rolling\s*usage\s*(\d+(?:\.\d+)?)\s*%/i);
+  const weeklyMatch = plainText.match(/weekly\s*usage\s*(\d+(?:\.\d+)?)\s*%/i);
+  const monthlyMatch = plainText.match(/monthly\s*usage\s*(\d+(?:\.\d+)?)\s*%/i);
+
+  if (!rollingMatch && !weeklyMatch && !monthlyMatch) return null;
+
+  const result: OpenCodeGoBrowserUsage = {
+    rollingUsedPct: rollingMatch ? Number(rollingMatch[1]) : -1,
+    weeklyUsedPct: weeklyMatch ? Number(weeklyMatch[1]) : -1,
+    monthlyUsedPct: monthlyMatch ? Number(monthlyMatch[1]) : -1,
+  };
+
+  // Try to extract reset hints
+  const rollingReset = plainText.match(/rolling\s*.*?reset(?:s)?\s*(?:in|:)\s*([^,.]+)/i);
+  const weeklyReset = plainText.match(/weekly\s*.*?reset(?:s)?\s*(?:in|:)\s*([^,.]+)/i);
+  const monthlyReset = plainText.match(/monthly\s*.*?reset(?:s)?\s*(?:in|:)\s*([^,.]+)/i);
+
+  if (rollingReset) result.rollingReset = rollingReset[1].trim();
+  if (weeklyReset) result.weeklyReset = weeklyReset[1].trim();
+  if (monthlyReset) result.monthlyReset = monthlyReset[1].trim();
+
+  return result;
+}
+
+/**
+ * Collect OpenCode Go usage via browser dashboard.
+ *
+ * SKELETON — full Playwright implementation not yet integrated.
+ * When enabled, this will:
+ * 1. Launch headless Chromium via Playwright
+ * 2. Navigate to opencode.ai workspace page
+ * 3. Extract visible usage percentages and reset times
+ * 4. Return ONLY normalized metadata
+ */
+async function collectBrowserUsage(): Promise<QuotaPoolSnapshot[] | null> {
+  if (!isExperimentalBrowserEnabled()) return null;
+
+  if (!hasPlaywright()) {
+    console.warn(
+      "[opencode:browser] Experimental browser collector is enabled but Playwright is not installed.\n" +
+      "  Install with: npm install playwright\n" +
+      "  Then: npx playwright install chromium\n" +
+      "  Skipping browser collection.",
+    );
+    return null;
+  }
+
+  const workspaceId = getWorkspaceId();
+  if (!workspaceId) {
+    console.warn(
+      "[opencode:browser] Experimental browser collector enabled but no workspace ID.\n" +
+      "  Set DEVTRACK_OPENCODE_GO_WORKSPACE_ID=wrk_... or add to ~/.local/share/ega-devtrack/opencode-go.json\n" +
+      "  Skipping browser collection.",
+    );
+    return null;
+  }
+
+  console.warn(
+    "[opencode:browser] Experimental browser dashboard collector is ENABLED.\n" +
+    `  Workspace: https://opencode.ai/workspace/${workspaceId}/go\n` +
+    "  This will read usage from the OpenCode Go workspace page using a local browser.\n" +
+    "  Only normalized usage percentages and reset times are uploaded.\n" +
+    "  Cookies, auth tokens, and raw HTML are NEVER uploaded.\n" +
+    "  To disable: unset DEVTRACK_EXPERIMENTAL_OPENCODE_GO_BROWSER_USAGE",
+  );
+
+  // --- Browser collection stub ---
+  // Full implementation requires Playwright integration
+  console.warn(
+    "[opencode:browser] Browser collection not yet fully implemented.\n" +
+    "  Use `ega-devtrack opencode-go manual ...` to enter usage values, or\n" +
+    "  enter usage via the dashboard manual usage form.",
+  );
+  return null;
 }
 
 // ── Main Collector ────────────────────────────────────────────
 
 export async function collectOpenCode(): Promise<OpenCodeCollectorResult> {
-  // ── Detect OpenCode installation ─────────────────────────
+  const USAGE_UNKNOWN = -1;
+  const now = new Date();
+
+  // ── Detect OpenCode ─────────────────────────────────────────
   let stdout: string;
   try {
     const result = await execFileAsync("opencode", ["models"], {
@@ -208,81 +372,95 @@ export async function collectOpenCode(): Promise<OpenCodeCollectorResult> {
     return { snapshots: [], toolInfos: [] };
   }
 
-  // ── Parse ────────────────────────────────────────────────
   const entries = parseModelsOutput(stdout);
   if (entries.length === 0) {
     return { snapshots: [], toolInfos: [] };
   }
 
   const pool = classifyPool(entries);
-  const now = new Date();
 
-  // ── Build detection snapshots with usage_unknown (-1) ─────
-  // Each pool gets a detection snapshot — usage unknown until manual entry.
-  // Only emit for OpenCode Go (the pool we care about).
-  const snapshots: QuotaPoolSnapshot[] = [];
+  // ── Try browser collection (Level 3) ────────────────────────
+  const browserSnapshots = await collectBrowserUsage();
 
-  if (pool.poolName === "OpenCode Go") {
-    const USAGE_UNKNOWN = -1;
+  let snapshots: QuotaPoolSnapshot[];
+  let usageSource: string;
+  let usageStatus: string;
+
+  if (browserSnapshots && browserSnapshots.length > 0) {
+    snapshots = browserSnapshots;
+    usageSource = "opencode_go_browser_dashboard";
+    usageStatus = "browser_confirmed";
+  } else if (pool.poolName === "OpenCode Go") {
+    // Emit detection windows
     const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-    const windows = ["rolling", "weekly", "monthly"];
+    usageSource = "detected";
+    usageStatus = "unknown_manual_required";
 
-    for (const windowName of windows) {
-      let windowStart: Date;
-      let windowEnd: Date;
-
-      switch (windowName) {
-        case "rolling":
-          windowEnd = new Date(now.getTime() + 60 * 60 * 1000);
-          windowStart = now;
-          break;
-        case "weekly": {
-          const start = new Date(now);
-          const day = start.getDay();
-          const diff = start.getDate() - day + (day === 0 ? -6 : 1);
-          start.setDate(diff);
-          start.setHours(0, 0, 0, 0);
-          windowStart = start;
-          windowEnd = new Date(start);
-          windowEnd.setDate(windowEnd.getDate() + 7);
-          break;
-        }
-        case "monthly":
-        default:
-          windowStart = new Date(now.getFullYear(), now.getMonth(), 1);
-          windowEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
-      }
-
-      snapshots.push({
+    snapshots = [
+      {
         quotaPoolId: pool.quotaPoolId,
-        windowName: `opencode-go-${windowName}`,
+        windowName: "opencode-go-rolling",
         usageAmount: USAGE_UNKNOWN,
-        windowStart: windowStart.toISOString(),
-        windowEnd: windowEnd.toISOString(),
-        idempotencyKey: `opencode-go-detect-${windowName}-${monthKey}`,
-        source: "detected",
+        windowStart: now.toISOString(),
+        windowEnd: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+        idempotencyKey: `opencode-go-detect-rolling-${monthKey}`,
+        source: usageSource,
         confidence: pool.confidence,
-      });
-    }
+      },
+      {
+        quotaPoolId: pool.quotaPoolId,
+        windowName: "opencode-go-weekly",
+        usageAmount: USAGE_UNKNOWN,
+        windowStart: (() => {
+          const s = new Date(now);
+          const d = s.getDay();
+          s.setDate(s.getDate() - d + (d === 0 ? -6 : 1));
+          s.setHours(0, 0, 0, 0);
+          return s.toISOString();
+        })(),
+        windowEnd: (() => {
+          const s = new Date(now);
+          const d = s.getDay();
+          s.setDate(s.getDate() - d + (d === 0 ? -6 : 1) + 7);
+          s.setHours(0, 0, 0, 0);
+          return s.toISOString();
+        })(),
+        idempotencyKey: `opencode-go-detect-weekly-${monthKey}`,
+        source: usageSource,
+        confidence: pool.confidence,
+      },
+      {
+        quotaPoolId: pool.quotaPoolId,
+        windowName: "opencode-go-monthly",
+        usageAmount: USAGE_UNKNOWN,
+        windowStart: new Date(now.getFullYear(), now.getMonth(), 1).toISOString(),
+        windowEnd: new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59).toISOString(),
+        idempotencyKey: `opencode-go-detect-monthly-${monthKey}`,
+        source: usageSource,
+        confidence: pool.confidence,
+      },
+    ];
   } else {
-    // Non-OpenCode-Go pools: just emit a heartbeat-style single snapshot
-    const windowStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const windowEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+    // Non-OpenCode-Go pools: simple heartbeat
     const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    usageSource = "detected";
+    usageStatus = "detected";
 
-    snapshots.push({
-      quotaPoolId: pool.quotaPoolId,
-      windowName: `${monthKey}-monthly`,
-      usageAmount: -1, // unknown
-      windowStart: windowStart.toISOString(),
-      windowEnd: windowEnd.toISOString(),
-      idempotencyKey: `opencode-${pool.poolName.toLowerCase().replace(/\s+/g, "-")}-${monthKey}`,
-      source: "detected",
-      confidence: pool.confidence,
-    });
+    snapshots = [
+      {
+        quotaPoolId: pool.quotaPoolId,
+        windowName: `${monthKey}-monthly`,
+        usageAmount: USAGE_UNKNOWN,
+        windowStart: new Date(now.getFullYear(), now.getMonth(), 1).toISOString(),
+        windowEnd: new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59).toISOString(),
+        idempotencyKey: `opencode-${pool.poolName.toLowerCase().replace(/\s+/g, "-")}-${monthKey}`,
+        source: usageSource,
+        confidence: pool.confidence,
+      },
+    ];
   }
 
-  // ── Build ToolInfo ───────────────────────────────────────
+  // ── Build ToolInfo ──────────────────────────────────────────
   const toolInfo: ToolInfo = {
     toolType: "opencode",
     displayName: `OpenCode CLI (${pool.poolName})`,
@@ -290,9 +468,11 @@ export async function collectOpenCode(): Promise<OpenCodeCollectorResult> {
     metadata: JSON.stringify({
       version: "detected",
       pool: pool.poolName,
-      usageStatus: "unknown_manual_required",
+      usageSource,
+      usageStatus,
       modelsCount: entries.length,
       detectedProviders: [...new Set(entries.map((e) => e.provider))].sort(),
+      browserEnabled: isExperimentalBrowserEnabled(),
     }),
   };
 
@@ -301,14 +481,11 @@ export async function collectOpenCode(): Promise<OpenCodeCollectorResult> {
     modelsCount: entries.length,
     detectedProviders: [...new Set(entries.map((e) => e.provider))].sort(),
     classifiedPool: pool.poolName,
-    usageStatus: "unknown_manual_required",
+    usageSource,
+    usageStatus,
+    browserEnabled: isExperimentalBrowserEnabled(),
   };
 
-  const result: OpenCodeCollectorResult = {
-    snapshots,
-    toolInfos: [toolInfo],
-    rawMetadata,
-  };
-
+  const result: OpenCodeCollectorResult = { snapshots, toolInfos: [toolInfo], rawMetadata };
   return sanitize(result) as OpenCodeCollectorResult;
 }

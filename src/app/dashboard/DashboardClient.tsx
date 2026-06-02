@@ -113,36 +113,60 @@ function usagePercentage(pool: QuotaPoolWithUsage): number | null {
   return Math.min(100, Math.round((Number(pool.usageCurrent.usageAmount) / total) * 100));
 }
 
-/**
- * Whether the pool has any real usage data (not just detected=0).
- * Used to distinguish "unknown usage" from "confirmed 0% used".
- */
-function hasKnownUsage(pool: QuotaPoolWithUsage): boolean {
-  if (!pool.usageCurrent) return false;
-  // If source is heartbeat/unknown and usage is 0, treat as unknown
-  const source = pool.usageCurrent.source ?? pool.source ?? "heartbeat";
-  const usageAmount = Number(pool.usageCurrent.usageAmount);
-  if (usageAmount === 0 && (source === "heartbeat" || source === "unknown" || source === "unknown_manual_required")) {
-    return false;
-  }
-  return true;
+/** Is usage known (not -1 sentinel)? */
+function isUsageKnown(amountStr: string): boolean {
+  return Number(amountStr) >= 0;
 }
 
-function windowUsagePct(pool: QuotaPoolWithUsage, window: UsageWindowData): number | null {
-  const total = Number(pool.totalAllocated);
+function windowUsagePct(window: UsageWindowData, totalAllocated: string): number | null {
+  const total = Number(totalAllocated);
   if (total <= 0) return null;
-  return Math.min(100, Math.round((Number(window.usageAmount) / total) * 100));
+  const amt = Number(window.usageAmount);
+  if (amt < 0) return null; // unknown
+  return Math.min(100, Math.round((amt / total) * 100));
 }
 
-function windowResetLabel(window: UsageWindowData): string {
-  const end = new Date(window.windowEnd);
-  const now = new Date();
-  const diffMs = end.getTime() - now.getTime();
-  if (diffMs <= 0) return "Expired";
-  const diffHrs = Math.ceil(diffMs / (1000 * 60 * 60));
-  if (diffHrs < 48) return `${diffHrs}h`;
-  const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
-  return `${diffDays}d`;
+function sourceBadge(source: string | null | undefined) {
+  if (!source || source === "detected" || source === "heartbeat") {
+    return <Badge variant="outline" className="text-[10px]">Detected</Badge>;
+  }
+  if (source === "codex_cli_status" || source === "codex-status") {
+    return <Badge variant="default" className="text-[10px]">CLI</Badge>;
+  }
+  if (source === "codex_browser_dashboard") {
+    return <Badge variant="default" className="text-[10px]">Browser</Badge>;
+  }
+  if (source === "manual" || source === "manual_opencode_go") {
+    return <Badge variant="secondary" className="text-[10px]">Manual</Badge>;
+  }
+  if (source === "opencode_go_browser_dashboard") {
+    return <Badge variant="default" className="text-[10px]">Browser</Badge>;
+  }
+  return <Badge variant="outline" className="text-[10px]">{source}</Badge>;
+}
+
+function confidenceLabel(confidence: string | null | undefined): string {
+  if (!confidence) return "";
+  const n = Number(confidence);
+  if (n >= 0.9) return "High";
+  if (n >= 0.7) return "Med";
+  return "Low";
+}
+
+function isStale(lastUpdatedAt: string | null | undefined, maxMin = 30): boolean {
+  if (!lastUpdatedAt) return true;
+  const ageMs = Date.now() - new Date(lastUpdatedAt).getTime();
+  return ageMs > maxMin * 60 * 1000;
+}
+
+function staleIndicator(lastUpdatedAt: string | null | undefined): string {
+  if (!lastUpdatedAt) return "Never";
+  const ageMin = Math.floor((Date.now() - new Date(lastUpdatedAt).getTime()) / 60000);
+  if (ageMin < 1) return "Just now";
+  if (ageMin < 60) return `${ageMin}m ago`;
+  const ageHr = Math.floor(ageMin / 60);
+  if (ageHr < 24) return `${ageHr}h ago`;
+  return `${Math.floor(ageHr / 24)}d ago`;
 }
 
 function resetLabel(policy: string): string {
@@ -163,126 +187,64 @@ function kindLabel(kind: string): string {
   }
 }
 
-function confidenceBadge(pool: QuotaPoolWithUsage) {
-  if (!pool.usageCurrent) {
-    return <Badge variant="ghost">No data</Badge>;
-  }
-  if (pool.source === "manual" || pool.confidence === "0.700") {
-    return <Badge variant="secondary">Manual</Badge>;
-  }
-  return <Badge variant="default">Confirmed</Badge>;
-}
-
-function sourceLabel(pool: QuotaPoolWithUsage): string {
-  if (!pool.usageCurrent) return "—";
-  const src = pool.usageCurrent.source ?? pool.source;
-  if (src === "manual" || src === "manual_opencode_go") return "Manual";
-  if (src === "codex_cli_status" || src === "codex-status") return "CLI";
-  if (src === "heartbeat") return "Detected";
-  return "System";
-}
-
 function timeAgo(dateStr: string | null): string {
   if (!dateStr) return "Never";
-  const date = new Date(dateStr);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffMin = Math.floor(diffMs / 60000);
+  const diffMin = Math.floor((Date.now() - new Date(dateStr).getTime()) / 60000);
   if (diffMin < 1) return "Just now";
   if (diffMin < 60) return `${diffMin}m ago`;
   const diffHr = Math.floor(diffMin / 60);
   if (diffHr < 24) return `${diffHr}h ago`;
-  const diffDay = Math.floor(diffHr / 24);
-  return `${diffDay}d ago`;
+  return `${Math.floor(diffHr / 24)}d ago`;
 }
 
 // ── Alert Logic ────────────────────────────────────────────────
 
 function computeAlerts(pools: QuotaPoolWithUsage[]): PoolAlert[] {
   const alerts: PoolAlert[] = [];
-
   for (const pool of pools) {
     const pct = usagePercentage(pool);
-    // Unknown usage: no usageCurrent, no totalAllocated, or pct is null → skip
     if (pct === null) continue;
     const total = Number(pool.totalAllocated);
     if (total <= 0) continue;
 
     let level: AlertLevel | null = null;
-    if (pct >= 100) {
-      level = "exhausted";
-    } else if (pct >= 90) {
-      level = "critical";
-    } else if (pct >= 70) {
-      level = "warning";
-    }
+    if (pct >= 100) level = "exhausted";
+    else if (pct >= 90) level = "critical";
+    else if (pct >= 70) level = "warning";
 
     if (level) {
       alerts.push({
-        level,
-        poolName: pool.displayName,
-        usagePercent: pct,
+        level, poolName: pool.displayName, usagePercent: pct,
         windowName: pool.usageCurrent?.windowName ?? "—",
-        source: sourceLabel(pool),
+        source: pool.usageCurrent?.source ?? "—",
         confidence: pool.confidence,
         resetPolicy: pool.rolloverPolicy,
       });
     }
   }
-
-  // Sort: exhausted first, then critical, then warning
-  const levelOrder: Record<AlertLevel, number> = { exhausted: 0, critical: 1, warning: 2 };
-  alerts.sort((a, b) => levelOrder[a.level] - levelOrder[b.level]);
-
+  const order: Record<AlertLevel, number> = { exhausted: 0, critical: 1, warning: 2 };
+  alerts.sort((a, b) => order[a.level] - order[b.level]);
   return alerts;
 }
 
 // ── Alert UI ───────────────────────────────────────────────────
 
 const alertLevelConfig: Record<AlertLevel, { label: string; badgeClass: string; borderClass: string; bgClass: string }> = {
-  warning: {
-    label: "Warning",
-    badgeClass: "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30",
-    borderClass: "border-amber-500/30",
-    bgClass: "bg-amber-500/5",
-  },
-  critical: {
-    label: "Critical",
-    badgeClass: "bg-orange-500/10 text-orange-600 dark:text-orange-400 border-orange-500/30",
-    borderClass: "border-orange-500/30",
-    bgClass: "bg-orange-500/5",
-  },
-  exhausted: {
-    label: "Exhausted",
-    badgeClass: "bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/30",
-    borderClass: "border-red-500/30",
-    bgClass: "bg-red-500/5",
-  },
+  warning: { label: "Warning", badgeClass: "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30", borderClass: "border-amber-500/30", bgClass: "bg-amber-500/5" },
+  critical: { label: "Critical", badgeClass: "bg-orange-500/10 text-orange-600 dark:text-orange-400 border-orange-500/30", borderClass: "border-orange-500/30", bgClass: "bg-orange-500/5" },
+  exhausted: { label: "Exhausted", badgeClass: "bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/30", borderClass: "border-red-500/30", bgClass: "bg-red-500/5" },
 };
 
 function AlertsBanner({ alerts }: { alerts: PoolAlert[] }) {
   if (alerts.length === 0) return null;
-
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-2">
-        <svg
-          className="h-5 w-5 text-amber-500"
-          fill="none"
-          viewBox="0 0 24 24"
-          strokeWidth={1.5}
-          stroke="currentColor"
-        >
-          <path
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z"
-          />
+        <svg className="h-5 w-5 text-amber-500" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
         </svg>
         <h2 className="text-lg font-semibold">Alerts</h2>
-        <Badge variant="outline" className="ml-1">
-          {alerts.length}
-        </Badge>
+        <Badge variant="outline" className="ml-1">{alerts.length}</Badge>
       </div>
       <div className="space-y-2">
         {alerts.map((alert, idx) => {
@@ -295,26 +257,11 @@ function AlertsBanner({ alerts }: { alerts: PoolAlert[] }) {
               </AlertTitle>
               <AlertDescription>
                 <div className="mt-1 grid grid-cols-2 gap-x-4 gap-y-1 text-xs sm:grid-cols-4">
-                  <div>
-                    <span className="text-muted-foreground">Usage: </span>
-                    <span className="font-medium tabular-nums">{alert.usagePercent}%</span>
-                  </div>
-                  <div>
-                    <span className="text-muted-foreground">Window: </span>
-                    <span className="font-medium">{alert.windowName}</span>
-                  </div>
-                  <div>
-                    <span className="text-muted-foreground">Source: </span>
-                    <span className="font-medium">{alert.source}</span>
-                  </div>
-                  <div>
-                    <span className="text-muted-foreground">Confidence: </span>
-                    <span className="font-medium">{alert.confidence ?? "—"}</span>
-                  </div>
-                  <div className="col-span-2 sm:col-span-4">
-                    <span className="text-muted-foreground">Reset: </span>
-                    <span className="font-medium">{resetLabel(alert.resetPolicy)}</span>
-                  </div>
+                  <div><span className="text-muted-foreground">Usage: </span><span className="font-medium tabular-nums">{alert.usagePercent}%</span></div>
+                  <div><span className="text-muted-foreground">Window: </span><span className="font-medium">{alert.windowName}</span></div>
+                  <div><span className="text-muted-foreground">Source: </span><span className="font-medium">{alert.source}</span></div>
+                  <div><span className="text-muted-foreground">Confidence: </span><span className="font-medium">{alert.confidence ?? "—"}</span></div>
+                  <div className="col-span-2 sm:col-span-4"><span className="text-muted-foreground">Reset: </span><span className="font-medium">{resetLabel(alert.resetPolicy)}</span></div>
                 </div>
               </AlertDescription>
             </Alert>
@@ -325,177 +272,47 @@ function AlertsBanner({ alerts }: { alerts: PoolAlert[] }) {
   );
 }
 
-function PoolAlertBadge({ pct }: { pct: number | null }) {
-  if (pct === null) return null;
+// ── Pool Card (multi-window) ───────────────────────────────────
 
-  let label: string;
-  let className: string;
-
-  if (pct >= 100) {
-    label = "Exhausted";
-    className = "bg-red-600 hover:bg-red-600 text-white";
-  } else if (pct >= 90) {
-    label = "Critical";
-    className = "bg-orange-500 hover:bg-orange-500 text-white";
-  } else if (pct >= 70) {
-    label = "Warning";
-    className = "bg-amber-500 hover:bg-amber-500 text-white";
-  } else {
-    return null;
-  }
-
-  return <Badge className={className}>{label}</Badge>;
-}
-
-// ── Loading Skeleton ───────────────────────────────────────────
-
-function DashboardSkeleton() {
-  return (
-    <div className="space-y-8">
-      <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-        {[1, 2, 3].map((i) => (
-          <Card key={i}>
-            <CardHeader>
-              <Skeleton className="h-5 w-32" />
-              <Skeleton className="h-4 w-48" />
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <Skeleton className="h-2 w-full" />
-              <Skeleton className="h-4 w-24" />
-              <Skeleton className="h-4 w-36" />
-            </CardContent>
-            <CardFooter>
-              <Skeleton className="h-5 w-20" />
-            </CardFooter>
-          </Card>
-        ))}
-      </div>
-      <Separator />
-      <Card>
-        <CardHeader>
-          <Skeleton className="h-5 w-32" />
-        </CardHeader>
-        <CardContent>
-          <Skeleton className="h-8 w-full" />
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
-// ── Empty State ────────────────────────────────────────────────
-
-function EmptyState({ workspaceId }: { workspaceId?: string }) {
-  return (
-    <div className="space-y-8">
-      <Card className="p-12 text-center">
-        <CardContent>
-          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
-            <svg
-              className="h-6 w-6 text-muted-foreground"
-              fill="none"
-              viewBox="0 0 24 24"
-              strokeWidth={1.5}
-              stroke="currentColor"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125"
-              />
-            </svg>
-          </div>
-          <h3 className="mb-2 text-lg font-medium">No quota data yet</h3>
-          <p className="text-sm text-muted-foreground">
-            No quota data yet — register device/run agent.
-          </p>
-        </CardContent>
-      </Card>
-
-      {workspaceId && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Tracked Devices</CardTitle>
-            <CardDescription>
-              Register devices to track their AI tool usage.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex items-center justify-center py-6">
-            <Link href="/devices/add">
-              <Button>Add Device</Button>
-            </Link>
-          </CardContent>
-        </Card>
-      )}
-    </div>
-  );
-}
-
-// ── Error State ────────────────────────────────────────────────
-
-function ErrorState({ message, onRetry }: { message: string; onRetry: () => void }) {
-  return (
-    <Card className="border-destructive/50 p-12 text-center">
-      <CardContent>
-        <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-destructive/10">
-          <svg
-            className="h-6 w-6 text-destructive"
-            fill="none"
-            viewBox="0 0 24 24"
-            strokeWidth={1.5}
-            stroke="currentColor"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z"
-            />
-          </svg>
-        </div>
-        <h3 className="mb-2 text-lg font-medium">Failed to load</h3>
-        <p className="mb-4 text-sm text-muted-foreground">{message}</p>
-        <button
-          onClick={onRetry}
-          className="inline-flex items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
-        >
-          Try again
-        </button>
-      </CardContent>
-    </Card>
-  );
-}
-
-// ── Pool Card ──────────────────────────────────────────────────
-
-function WindowRow({ pool, window: w }: { pool: QuotaPoolWithUsage; window: UsageWindowData }) {
-  const pct = windowUsagePct(pool, w);
-  const sourceLabel_ = w.source ?? pool.source ?? "—";
-  const confidenceLabel = w.confidence ?? pool.confidence;
+function WindowRow({ window: w, pool }: { window: UsageWindowData; pool: QuotaPoolWithUsage }) {
+  const pct = windowUsagePct(w, pool.totalAllocated);
+  const known = isUsageKnown(w.usageAmount);
+  const stale = isStale(w.lastUpdatedAt);
 
   return (
     <div className="rounded-md border p-2.5 space-y-1.5">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium capitalize">{w.windowName.replace(/-/g, " ")}</span>
         <div className="flex items-center gap-2">
-          <span className="text-xs tabular-nums font-semibold">
-            {pct !== null ? `${pct}%` : "—"}
-          </span>
-          {confidenceLabel && (
-            <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
-              {Number(confidenceLabel) >= 0.8 ? "High" : Number(confidenceLabel) >= 0.5 ? "Med" : "Low"}
-            </Badge>
+          <span className="text-xs font-medium capitalize">{w.windowName.replace(/-/g, " ")}</span>
+          {stale && known && (
+            <Badge variant="outline" className="text-[10px] text-amber-500 border-amber-500/30">Stale</Badge>
           )}
         </div>
+        <div className="flex items-center gap-2">
+          {known ? (
+            <span className="text-xs tabular-nums font-semibold">{pct}%</span>
+          ) : (
+            <span className="text-xs text-muted-foreground">Unknown</span>
+          )}
+          {sourceBadge(w.source)}
+        </div>
       </div>
-      <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted">
-        <div
-          className="h-full rounded-full bg-primary transition-all"
-          style={{ width: `${pct ?? 0}%` }}
-        />
-      </div>
+
+      {known ? (
+        <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted">
+          <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${pct ?? 0}%` }} />
+        </div>
+      ) : (
+        <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted">
+          <div className="h-full rounded-full bg-muted-foreground/20" style={{ width: "100%" }} />
+        </div>
+      )}
+
       <div className="flex items-center justify-between text-[10px] text-muted-foreground">
-        <span>{sourceLabel_ !== "—" ? `Source: ${sourceLabel_}` : "Unknown source"}</span>
-        <span>Reset: {windowResetLabel(w)}</span>
+        <span>Updated {staleIndicator(w.lastUpdatedAt)}</span>
+        <span className="flex items-center gap-1">
+          {w.confidence && <span>Conf: {confidenceLabel(w.confidence)}</span>}
+        </span>
       </div>
     </div>
   );
@@ -503,10 +320,11 @@ function WindowRow({ pool, window: w }: { pool: QuotaPoolWithUsage; window: Usag
 
 function PoolCard({ pool }: { pool: QuotaPoolWithUsage }) {
   const pct = usagePercentage(pool);
-  const hasUsage = hasKnownUsage(pool);
   const windows = pool.usageWindows && pool.usageWindows.length > 0
     ? pool.usageWindows
     : (pool.usageCurrent ? [pool.usageCurrent] : []);
+
+  const hasWindows = windows.length > 0;
 
   return (
     <Card>
@@ -515,36 +333,33 @@ function PoolCard({ pool }: { pool: QuotaPoolWithUsage }) {
           <div>
             <CardTitle>{pool.displayName}</CardTitle>
             <CardDescription>
-              <Badge variant="secondary" className="mt-1">
-                {kindLabel(pool.kind)}
-              </Badge>
+              <Badge variant="secondary" className="mt-1">{kindLabel(pool.kind)}</Badge>
             </CardDescription>
           </div>
           <div className="flex items-center gap-2">
-            <PoolAlertBadge pct={pct} />
-            {confidenceBadge(pool)}
+            {pct !== null && pct >= 70 && (
+              <Badge className={pct >= 100 ? "bg-red-600 text-white" : pct >= 90 ? "bg-orange-500 text-white" : "bg-amber-500 text-white"}>
+                {pct >= 100 ? "Exhausted" : pct >= 90 ? "Critical" : "Warning"}
+              </Badge>
+            )}
+            {!hasWindows && <Badge variant="ghost">No data</Badge>}
           </div>
         </div>
       </CardHeader>
 
       <CardContent className="space-y-3">
-        {hasUsage && windows.length > 0 ? (
+        {hasWindows ? (
           <div className="space-y-2">
             {windows.map((w) => (
-              <WindowRow key={w.windowName} pool={pool} window={w} />
+              <WindowRow key={w.windowName} window={w} pool={pool} />
             ))}
           </div>
         ) : (
           <div className="space-y-1">
             <div className="relative h-2 w-full overflow-hidden rounded-full bg-muted">
-              <div
-                className="h-full rounded-full bg-muted-foreground/20"
-                style={{ width: "100%" }}
-              />
+              <div className="h-full rounded-full bg-muted-foreground/20" style={{ width: "100%" }} />
             </div>
-            <p className="text-xs text-muted-foreground">
-              Usage unknown — run collector or enter manual usage
-            </p>
+            <p className="text-xs text-muted-foreground">Usage unknown — run collector or enter manual usage</p>
           </div>
         )}
 
@@ -552,21 +367,13 @@ function PoolCard({ pool }: { pool: QuotaPoolWithUsage }) {
       </CardContent>
 
       <CardFooter className="flex items-center justify-between text-xs text-muted-foreground">
-        <div className="flex items-center gap-3">
-          <span>
-            Reset: <span className="font-medium text-foreground">{resetLabel(pool.rolloverPolicy)}</span>
-          </span>
-          <span className="text-border">|</span>
-          <span>
-            Source: <span className="font-medium text-foreground">{sourceLabel(pool)}</span>
-          </span>
-        </div>
+        <span>Reset: <span className="font-medium text-foreground">{resetLabel(pool.rolloverPolicy)}</span></span>
       </CardFooter>
     </Card>
   );
 }
 
-// ── Device Card ────────────────────────────────────────────────
+// ── Record Manual Usage Dialog ─────────────────────────────────
 
 function RecordManualUsageDialog({ pool }: { pool: QuotaPoolWithUsage }) {
   const router = useRouter();
@@ -576,25 +383,15 @@ function RecordManualUsageDialog({ pool }: { pool: QuotaPoolWithUsage }) {
   const [resetTime, setResetTime] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<{
-    usageAmount: string;
-    usagePercentage: number;
-  } | null>(null);
+  const [success, setSuccess] = useState<{ usageAmount: string; usagePercentage: number } | null>(null);
 
   const totalAlloc = Number(pool.totalAllocated);
 
   const handleSubmit = async () => {
     const amount = Number(usageAmount);
     if (isNaN(amount)) return;
-
-    if (amount < 0) {
-      setError("Usage amount cannot be negative");
-      return;
-    }
-    if (amount > totalAlloc) {
-      setError(`Usage amount (${amount}) exceeds total allocated (${totalAlloc})`);
-      return;
-    }
+    if (amount < 0) { setError("Usage amount cannot be negative"); return; }
+    if (amount > totalAlloc) { setError(`Usage amount (${amount}) exceeds total allocated (${totalAlloc})`); return; }
 
     setSubmitting(true);
     setError(null);
@@ -604,24 +401,17 @@ function RecordManualUsageDialog({ pool }: { pool: QuotaPoolWithUsage }) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          quotaPoolId: pool.id,
-          usageAmount: amount,
+          quotaPoolId: pool.id, usageAmount: amount,
           description: description || undefined,
           resetTime: resetTime ? new Date(resetTime).toISOString() : undefined,
         }),
       });
-
       const data = await res.json();
-
       if (!res.ok) {
         const detailMsg = data.details?.[0]?.message ?? data.error ?? "Unknown error";
         throw new Error(detailMsg);
       }
-
-      setSuccess({
-        usageAmount: data.quotaPool.usageAmount,
-        usagePercentage: data.quotaPool.usagePercentage,
-      });
+      setSuccess({ usageAmount: data.quotaPool.usageAmount, usagePercentage: data.quotaPool.usagePercentage });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Submission failed");
     } finally {
@@ -631,46 +421,28 @@ function RecordManualUsageDialog({ pool }: { pool: QuotaPoolWithUsage }) {
 
   const handleClose = () => {
     setOpen(false);
-    setUsageAmount("");
-    setDescription("");
-    setResetTime("");
-    setError(null);
-    setSuccess(null);
+    setUsageAmount(""); setDescription(""); setResetTime("");
+    setError(null); setSuccess(null);
     router.refresh();
   };
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger render={<Button variant="outline" size="sm" className="w-full" />}>
-        <svg
-          className="mr-1 h-4 w-4"
-          fill="none"
-          viewBox="0 0 24 24"
-          strokeWidth={1.5}
-          stroke="currentColor"
-        >
-          <path
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182"
-          />
+        <svg className="mr-1 h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182" />
         </svg>
         Record Manual Usage
       </DialogTrigger>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>Record Manual Usage</DialogTitle>
-          <DialogDescription>
-            Record usage for <span className="font-medium">{pool.displayName}</span>
-          </DialogDescription>
+          <DialogDescription>Record usage for <span className="font-medium">{pool.displayName}</span></DialogDescription>
         </DialogHeader>
-
         {success ? (
           <div className="space-y-3 py-2">
             <div className="rounded-lg bg-green-500/10 p-3">
-              <p className="text-sm font-medium text-green-600 dark:text-green-400">
-                Usage recorded successfully
-              </p>
+              <p className="text-sm font-medium text-green-600 dark:text-green-400">Usage recorded successfully</p>
             </div>
             <div className="rounded-lg bg-muted p-3 space-y-1.5">
               <div className="flex items-center justify-between text-sm">
@@ -681,14 +453,8 @@ function RecordManualUsageDialog({ pool }: { pool: QuotaPoolWithUsage }) {
                 <span className="text-muted-foreground">Source</span>
                 <Badge variant="secondary">Manual</Badge>
               </div>
-              <div className="flex items-center justify-between text-sm">
-                <span className="text-muted-foreground">Confidence</span>
-                <Badge variant="outline">70%</Badge>
-              </div>
             </div>
-            <DialogFooter>
-              <Button onClick={handleClose}>Done</Button>
-            </DialogFooter>
+            <DialogFooter><Button onClick={handleClose}>Done</Button></DialogFooter>
           </div>
         ) : (
           <div className="space-y-4 py-2">
@@ -696,43 +462,22 @@ function RecordManualUsageDialog({ pool }: { pool: QuotaPoolWithUsage }) {
               <Badge variant="secondary">{kindLabel(pool.kind)}</Badge>
               <span>Total: {pool.totalAllocated}</span>
             </div>
-
             <div className="space-y-2">
               <Label htmlFor="manual-amount">Usage Amount</Label>
-              <Input
-                id="manual-amount"
-                type="number"
-                step="0.01"
-                min="0"
-                max={totalAlloc}
-                placeholder={`0 to ${totalAlloc}`}
-                value={usageAmount}
-                onChange={(e) => setUsageAmount(e.target.value)}
-              />
+              <Input id="manual-amount" type="number" step="0.01" min="0" max={totalAlloc}
+                placeholder={`0 to ${totalAlloc}`} value={usageAmount}
+                onChange={(e) => setUsageAmount(e.target.value)} />
             </div>
-
             <div className="space-y-2">
               <Label htmlFor="manual-desc">Description (optional)</Label>
-              <Input
-                id="manual-desc"
-                type="text"
-                placeholder="e.g. Weekly usage report"
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                maxLength={500}
-              />
+              <Input id="manual-desc" type="text" placeholder="e.g. Weekly usage report"
+                value={description} onChange={(e) => setDescription(e.target.value)} maxLength={500} />
             </div>
-
             <div className="space-y-2">
               <Label htmlFor="manual-reset">Reset Time (optional)</Label>
-              <Input
-                id="manual-reset"
-                type="datetime-local"
-                value={resetTime}
-                onChange={(e) => setResetTime(e.target.value)}
-              />
+              <Input id="manual-reset" type="datetime-local" value={resetTime}
+                onChange={(e) => setResetTime(e.target.value)} />
             </div>
-
             {error && (
               <div className="rounded-lg bg-destructive/10 p-2.5">
                 <p className="text-xs text-destructive">{error}</p>
@@ -740,19 +485,10 @@ function RecordManualUsageDialog({ pool }: { pool: QuotaPoolWithUsage }) {
             )}
           </div>
         )}
-
         {!success && (
           <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              onClick={handleSubmit}
-              disabled={submitting || !usageAmount || isNaN(Number(usageAmount))}
-            >
+            <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
+            <Button onClick={handleSubmit} disabled={submitting || !usageAmount || isNaN(Number(usageAmount))}>
               {submitting ? "Submitting..." : "Record"}
             </Button>
           </DialogFooter>
@@ -762,51 +498,32 @@ function RecordManualUsageDialog({ pool }: { pool: QuotaPoolWithUsage }) {
   );
 }
 
-// ── Device Card ────────────────────────────────────────────────
+// ── Device List ────────────────────────────────────────────────
 
 function healthBadge(healthState: string) {
   switch (healthState) {
-    case "active":
-      return <Badge className="bg-green-600 hover:bg-green-600">Active</Badge>;
-    case "stale":
-      return <Badge className="bg-yellow-500 hover:bg-yellow-500">Stale</Badge>;
-    case "offline":
-      return <Badge className="bg-red-600 hover:bg-red-600">Offline</Badge>;
-    default:
-      return <Badge variant="secondary">Unknown</Badge>;
+    case "active": return <Badge className="bg-green-600 hover:bg-green-600">Active</Badge>;
+    case "stale": return <Badge className="bg-yellow-500 hover:bg-yellow-500">Stale</Badge>;
+    case "offline": return <Badge className="bg-red-600 hover:bg-red-600">Offline</Badge>;
+    default: return <Badge variant="secondary">Unknown</Badge>;
   }
 }
 
 function DeviceCard({ device }: { device: DeviceInfo }) {
   const lastSeenInfo = device.lastHeartbeat ?? device.lastSeenAt;
   const lastSeenText = lastSeenInfo ? timeAgo(lastSeenInfo) : "Never";
-  const osInfo = device.os || "Unknown OS";
-  const agentInfo = device.agentVersion ? `v${device.agentVersion}` : null;
-
   return (
     <div className="flex items-center justify-between rounded-lg border p-3">
       <div className="flex items-center gap-3">
         <div className="flex h-8 w-8 items-center justify-center rounded-full bg-muted">
-          <svg
-            className="h-4 w-4 text-muted-foreground"
-            fill="none"
-            viewBox="0 0 24 24"
-            strokeWidth={1.5}
-            stroke="currentColor"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M10.5 1.5H8.25A2.25 2.25 0 006 3.75v16.5a2.25 2.25 0 002.25 2.25h7.5A2.25 2.25 0 0018 20.25V3.75a2.25 2.25 0 00-2.25-2.25H13.5m-3 0V3h3V1.5m-3 0h3m-3 18.75h3"
-            />
+          <svg className="h-4 w-4 text-muted-foreground" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M10.5 1.5H8.25A2.25 2.25 0 006 3.75v16.5a2.25 2.25 0 002.25 2.25h7.5A2.25 2.25 0 0018 20.25V3.75a2.25 2.25 0 00-2.25-2.25H13.5m-3 0V3h3V1.5m-3 0h3m-3 18.75h3" />
           </svg>
         </div>
         <div>
           <p className="text-sm font-medium">{device.label || "Unnamed device"}</p>
           <p className="text-xs text-muted-foreground">
-            {osInfo}
-            {agentInfo ? ` · ${agentInfo}` : ""}
-            {` · Seen ${lastSeenText}`}
+            {device.os || "Unknown OS"}{device.agentVersion ? ` · v${device.agentVersion}` : ""}{` · Seen ${lastSeenText}`}
           </p>
         </div>
       </div>
@@ -815,52 +532,27 @@ function DeviceCard({ device }: { device: DeviceInfo }) {
   );
 }
 
-// ── Device List ────────────────────────────────────────────────
-
-function DeviceList({ devices: devicesList }: { devices: DeviceInfo[]; workspaceId: string }) {
+function DeviceList({ devices }: { devices: DeviceInfo[]; workspaceId: string }) {
   return (
     <Card>
       <CardHeader>
         <div className="flex items-center justify-between">
           <div>
             <CardTitle>Tracked Devices</CardTitle>
-            <CardDescription>
-              {devicesList.length === 1
-                ? "1 registered device"
-                : `${devicesList.length} registered devices`}
-            </CardDescription>
+            <CardDescription>{devices.length === 1 ? "1 registered device" : `${devices.length} registered devices`}</CardDescription>
           </div>
-          <Link href="/devices/add">
-            <Button variant="outline" size="sm">
-              <svg
-                className="mr-1 h-4 w-4"
-                fill="none"
-                viewBox="0 0 24 24"
-                strokeWidth={1.5}
-                stroke="currentColor"
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-              </svg>
-              Add Device
-            </Button>
-          </Link>
+          <Link href="/devices/add"><Button variant="outline" size="sm"><svg className="mr-1 h-4 w-4" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>Add Device</Button></Link>
         </div>
       </CardHeader>
       <CardContent>
-        {devicesList.length === 0 ? (
+        {devices.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-6 text-center">
             <p className="text-sm text-muted-foreground">No devices registered yet.</p>
-            <Link href="/devices/add" className="mt-2">
-              <Button variant="link" size="sm">
-                Register your first device
-              </Button>
-            </Link>
+            <Link href="/devices/add" className="mt-2"><Button variant="link" size="sm">Register your first device</Button></Link>
           </div>
         ) : (
           <div className="space-y-2">
-            {devicesList.map((device) => (
-              <DeviceCard key={device.id} device={device} />
-            ))}
+            {devices.map((device) => <DeviceCard key={device.id} device={device} />)}
           </div>
         )}
       </CardContent>
@@ -877,32 +569,23 @@ async function fetchDashboardData(): Promise<DashboardState> {
     throw new Error(body.error ?? `Failed to fetch workspaces (${res.status})`);
   }
   const { workspaces: wsList } = await res.json();
-
-  if (!wsList || wsList.length === 0) {
-    return { status: "empty" };
-  }
+  if (!wsList || wsList.length === 0) return { status: "empty" };
 
   const workspace = wsList[0];
   const workspaceId = workspace.id;
 
-  // Fetch pools and devices in parallel
   const [poolsRes, devicesRes] = await Promise.all([
     fetch(`/api/workspaces/${workspaceId}/quota-pools`, { cache: "no-store" }),
     fetch(`/api/workspaces/${workspaceId}/devices`, { cache: "no-store" }),
   ]);
 
-  if (!poolsRes.ok) {
-    const body = await poolsRes.json();
-    throw new Error(body.error ?? `Failed to fetch quota pools (${poolsRes.status})`);
-  }
+  if (!poolsRes.ok) { const body = await poolsRes.json(); throw new Error(body.error ?? `Failed to fetch quota pools (${poolsRes.status})`); }
 
   const poolsData = await poolsRes.json();
   const devicesData = devicesRes.ok ? await devicesRes.json() : { devices: [] };
   const devices = devicesData.devices ?? [];
 
-  if (!poolsData.pools || poolsData.pools.length === 0) {
-    return { status: "empty", workspace, devices };
-  }
+  if (!poolsData.pools || poolsData.pools.length === 0) return { status: "empty", workspace, devices };
 
   return toDashboardState(
     { ...poolsData.workspace, isDemoSeed: workspace.isDemoSeed },
@@ -917,31 +600,19 @@ export default function DashboardPage() {
   const [state, setState] = useState<DashboardState>({ status: "loading" });
 
   useEffect(() => {
-    const onMount = async () => {
+    (async () => {
       try {
-        const newState = await fetchDashboardData();
-        setState(newState);
+        setState(await fetchDashboardData());
       } catch (error) {
-        setState({
-          status: "error",
-          message: error instanceof Error ? error.message : "An unexpected error occurred",
-        });
+        setState({ status: "error", message: error instanceof Error ? error.message : "An unexpected error occurred" });
       }
-    };
-    onMount();
+    })();
   }, []);
 
   const handleRetry = useCallback(async () => {
     setState({ status: "loading" });
-    try {
-      const newState = await fetchDashboardData();
-      setState(newState);
-    } catch (error) {
-      setState({
-        status: "error",
-        message: error instanceof Error ? error.message : "An unexpected error occurred",
-      });
-    }
+    try { setState(await fetchDashboardData()); }
+    catch (error) { setState({ status: "error", message: error instanceof Error ? error.message : "An unexpected error occurred" }); }
   }, []);
 
   const alerts = state.status === "loaded" ? computeAlerts(state.pools) : [];
@@ -952,9 +623,7 @@ export default function DashboardPage() {
         {state.status === "loaded" && (
           <>
             <h1 className="text-2xl font-semibold tracking-tight">Quota Pool Dashboard</h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Workspace: {state.workspace.name}
-            </p>
+            <p className="mt-1 text-sm text-muted-foreground">Workspace: {state.workspace.name}</p>
           </>
         )}
         {state.status === "loading" && (
@@ -965,27 +634,57 @@ export default function DashboardPage() {
         )}
       </div>
 
-      {state.status === "loading" && <DashboardSkeleton />}
-      {state.status === "error" && <ErrorState message={state.message} onRetry={handleRetry} />}
-      {state.status === "empty" && (
-        <>
-          <EmptyState workspaceId={state.workspace?.id} />
-          {state.devices && state.devices.length > 0 && (
-            <div className="mt-8">
-              <DeviceList devices={state.devices} workspaceId={state.workspace?.id ?? ""} />
+      {state.status === "loading" && (
+        <div className="space-y-8">
+          <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+            {[1, 2, 3].map((i) => (
+              <Card key={i}>
+                <CardHeader><Skeleton className="h-5 w-32" /><Skeleton className="h-4 w-48" /></CardHeader>
+                <CardContent className="space-y-3"><Skeleton className="h-2 w-full" /><Skeleton className="h-4 w-24" /><Skeleton className="h-4 w-36" /></CardContent>
+                <CardFooter><Skeleton className="h-5 w-20" /></CardFooter>
+              </Card>
+            ))}
+          </div>
+          <Separator />
+          <Card><CardHeader><Skeleton className="h-5 w-32" /></CardHeader><CardContent><Skeleton className="h-8 w-full" /></CardContent></Card>
+        </div>
+      )}
+      {state.status === "error" && (
+        <Card className="border-destructive/50 p-12 text-center">
+          <CardContent>
+            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-destructive/10">
+              <svg className="h-6 w-6 text-destructive" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+              </svg>
             </div>
-          )}
-        </>
+            <h3 className="mb-2 text-lg font-medium">Failed to load</h3>
+            <p className="mb-4 text-sm text-muted-foreground">{state.message}</p>
+            <Button onClick={handleRetry}>Try again</Button>
+          </CardContent>
+        </Card>
+      )}
+      {state.status === "empty" && (
+        <div className="space-y-8">
+          <Card className="p-12 text-center">
+            <CardContent>
+              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+                <svg className="h-6 w-6 text-muted-foreground" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125" />
+                </svg>
+              </div>
+              <h3 className="mb-2 text-lg font-medium">No quota data yet</h3>
+              <p className="text-sm text-muted-foreground">No quota data yet — register device/run agent.</p>
+            </CardContent>
+          </Card>
+          {state.workspace?.id && <DeviceList devices={state.devices ?? []} workspaceId={state.workspace.id} />}
+        </div>
       )}
       {state.status === "loaded" && (
         <div className="space-y-8">
           {state.workspace.isDemoSeed && (
             <Alert>
               <AlertTitle>Demo seed data</AlertTitle>
-              <AlertDescription>
-                This workspace contains seeded demo quota pools. Register a device and run the agent
-                to replace demo usage with real production data.
-              </AlertDescription>
+              <AlertDescription>This workspace contains seeded demo quota pools. Register a device and run the agent to replace demo usage with real production data.</AlertDescription>
             </Alert>
           )}
           {alerts.length > 0 && (
@@ -994,15 +693,10 @@ export default function DashboardPage() {
               <Separator />
             </>
           )}
-
           <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-            {state.pools.map((pool) => (
-              <PoolCard key={pool.id} pool={pool} />
-            ))}
+            {state.pools.map((pool) => <PoolCard key={pool.id} pool={pool} />)}
           </div>
-
           <Separator />
-
           <DeviceList devices={state.devices} workspaceId={state.workspace.id} />
         </div>
       )}
