@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db/client";
-import { workspaces } from "@/lib/db/schema";
+import { quotaPools, usageCurrentState, workspaces } from "@/lib/db/schema";
+import { and, eq } from "drizzle-orm";
+
+export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
@@ -9,10 +12,36 @@ export async function GET() {
       .from(workspaces)
       .orderBy(workspaces.name);
 
-    return NextResponse.json({ workspaces: wsList });
+    const workspacesWithSeedFlag = await Promise.all(
+      wsList.map(async (workspace) => ({
+        ...workspace,
+        isDemoSeed: await isDemoSeedWorkspace(workspace.id),
+      })),
+    );
+
+    return NextResponse.json({ workspaces: workspacesWithSeedFlag });
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Internal server error";
     return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+async function isDemoSeedWorkspace(workspaceId: string): Promise<boolean> {
+  const [seedRow] = await db
+    .select({ id: quotaPools.id })
+    .from(quotaPools)
+    .innerJoin(usageCurrentState, eq(usageCurrentState.quotaPoolId, quotaPools.id))
+    .where(
+      and(
+        eq(quotaPools.workspaceId, workspaceId),
+        eq(quotaPools.accountFingerprint, "openai-codex-chatgpt-credits"),
+        eq(quotaPools.displayName, "Codex & ChatGPT"),
+        eq(quotaPools.totalAllocated, "1000"),
+        eq(usageCurrentState.usageAmount, "650"),
+      ),
+    )
+    .limit(1);
+
+  return Boolean(seedRow);
 }

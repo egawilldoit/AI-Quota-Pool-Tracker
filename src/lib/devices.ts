@@ -6,7 +6,7 @@ import {
   workspaces,
   agentHeartbeats,
 } from "./db/schema";
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, inArray } from "drizzle-orm";
 import { getEnv } from "./env";
 import { createHash } from "node:crypto";
 
@@ -355,8 +355,7 @@ export async function getDevicesWithHealth(
     .where(
       and(
         eq(agentHeartbeats.workspaceId, workspaceId),
-        // Filter to only our device fingerprints
-        ...fingerprints.map((fp) => eq(agentHeartbeats.deviceFingerprint, fp)),
+        inArray(agentHeartbeats.deviceFingerprint, fingerprints),
       ),
     )
     .orderBy(desc(agentHeartbeats.heartbeatAt));
