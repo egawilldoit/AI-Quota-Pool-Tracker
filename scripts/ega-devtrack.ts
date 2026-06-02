@@ -51,6 +51,7 @@ function showHelp(): void {
     ega-devtrack install                Install systemd timer (runs every 15 min)
     ega-devtrack uninstall              Remove installed systemd timer & service
     ega-devtrack status                 Show scheduler status
+    ega-devtrack verify                 Verify data pipeline freshness
     ega-devtrack --help                 Show this help
 
   OPTIONS:
@@ -773,6 +774,103 @@ function printUsageSummary(snapshots: { windowName: string; usageAmount: number;
   console.log("");
 }
 
+// ── Verify ─────────────────────────────────────────────────────────
+
+async function cmdVerify(): Promise<void> {
+  const config = readAgentConfig();
+  const apiBaseUrl = getApiBaseUrl(config);
+  const isRegistered = !!getDeviceToken(config);
+
+  console.log("");
+  console.log("  ega-devtrack — Real Data Verification");
+  console.log("  ─────────────────────────────────────");
+
+  // 1. Registered?
+  console.log(`  Registered:       ${isRegistered ? "YES" : "NO"}`);
+  if (!isRegistered) {
+    console.log("  → Run: ega-devtrack register --token <bootstrap-token>");
+  }
+  // Print config existence (not the token itself)
+  const configExists = existsSync(configPath());
+  console.log(`  Config file:      ${configExists ? "EXISTS" : "MISSING"} (${configPath().replace(homedir(), "~")})`);
+
+  // 2. Check upload reachable
+  try {
+    const freshenssUrl = `${apiBaseUrl.replace(/\/+$/, "")}/api/status/data-freshness`;
+    const response = await fetch(freshenssUrl, { signal: AbortSignal.timeout(10_000) });
+
+    if (response.ok) {
+      const data = (await response.json()) as Record<string, unknown>;
+      console.log(`  Upload reachable: YES (${apiBaseUrl})`);
+      console.log(`  Dashboard mode:   ${data.mode ?? "unknown"}`);
+      console.log(`  Devices:          ${String(data.deviceCount ?? "?")}`);
+      console.log(`  Windows tracked:  ${String(data.currentStateCount ?? "?")}`);
+      console.log(`  Stale windows:    ${String(data.staleWindowCount ?? "?")}`);
+
+      const receivedAt = data.latestReceivedAt as string | null;
+      const collectedAt = data.latestCollectedAt as string | null;
+
+      if (receivedAt) {
+        const ageMin = Math.floor((Date.now() - new Date(receivedAt).getTime()) / 60000);
+        console.log(`  Last received:    ${ageMin < 1 ? "Just now" : `${ageMin}m ago`} (${receivedAt})`);
+      } else {
+        console.log(`  Last received:    Never`);
+      }
+
+      if (collectedAt) {
+        const ageMin = Math.floor((Date.now() - new Date(collectedAt).getTime()) / 60000);
+        console.log(`  Last uploaded:    ${ageMin < 1 ? "Just now" : `${ageMin}m ago`} (${collectedAt})`);
+      } else {
+        console.log(`  Last uploaded:    Never`);
+      }
+
+      const sources = data.sources as string[] | undefined;
+      if (sources && sources.length > 0) {
+        console.log(`  Data sources:     ${sources.join(", ")}`);
+      }
+
+      const staleWindows = data.staleWindows as Array<Record<string, unknown>> | undefined;
+      if (staleWindows && staleWindows.length > 0) {
+        console.log("  Stale windows:");
+        for (const w of staleWindows.slice(0, 5)) {
+          console.log(`    ${String(w.windowName)}: ${String(w.ageMin)}m old`);
+        }
+      }
+    } else {
+      console.log(`  Upload reachable: HTTP ${response.status} (${apiBaseUrl})`);
+    }
+  } catch (err) {
+    console.log(`  Upload reachable: ERROR — ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // 3. Scheduler
+  try {
+    execSync("systemctl --user is-active ega-devtrack.timer", { stdio: "ignore" });
+    console.log("  Scheduler:        ACTIVE (every 15 min)");
+  } catch {
+    try {
+      execSync("systemctl --user is-enabled ega-devtrack.timer", { stdio: "ignore" });
+      console.log("  Scheduler:        INSTALLED but INACTIVE");
+      console.log("  → Run: ega-devtrack install");
+    } catch {
+      console.log("  Scheduler:        NOT INSTALLED");
+      console.log("  → Run: ega-devtrack install");
+    }
+  }
+
+  // 4. Recommendations
+  console.log("");
+  console.log("  Next recommended command:");
+  if (!isRegistered) {
+    console.log("    ega-devtrack register --token <bootstrap-token>");
+  } else {
+    console.log("    ega-devtrack once --upload    # Refresh data now");
+    console.log("    ega-devtrack status           # Check scheduler + spool");
+  }
+  console.log("  Dashboard:        https://ai-quota-pool-tracker.vercel.app/dashboard");
+  console.log("");
+}
+
 // ── Main dispatch ────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -815,6 +913,11 @@ async function main(): Promise<void> {
 
   if (command === "usage") {
     await cmdUsageCollect();
+    process.exit(0);
+  }
+
+  if (command === "verify") {
+    await cmdVerify();
     process.exit(0);
   }
 
