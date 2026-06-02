@@ -20,6 +20,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { QuotaPoolSnapshot, ToolInfo } from "../payload";
 import { sanitize } from "../sanitizer";
+import { resolvePoolId } from "../pool-map";
 
 const execFileAsync = promisify(execFile);
 
@@ -65,7 +66,7 @@ function classifyPool(entries: OpenCodeModelEntry[]): {
 
   if (hasOpenCodeGo) {
     return {
-      quotaPoolId: "00000000-0000-0000-0000-000000000002", // OpenCode Go
+      quotaPoolId: resolvePoolId("tokens"), // OpenCode Go
       poolName: "OpenCode Go",
       confidence: 0.8,
     };
@@ -73,7 +74,7 @@ function classifyPool(entries: OpenCodeModelEntry[]): {
 
   if (hasOpenAi) {
     return {
-      quotaPoolId: "00000000-0000-0000-0000-000000000003", // OpenAI Provider
+      quotaPoolId: resolvePoolId("api_calls"), // OpenAI Provider
       poolName: "OpenAI Provider",
       confidence: 0.7,
     };
@@ -81,7 +82,7 @@ function classifyPool(entries: OpenCodeModelEntry[]): {
 
   if (hasOpenCodeFree) {
     return {
-      quotaPoolId: "00000000-0000-0000-0000-000000000004", // Free/Unknown
+      quotaPoolId: resolvePoolId("free"), // Free/Unknown
       poolName: "Free",
       confidence: 0.5,
     };
@@ -89,7 +90,7 @@ function classifyPool(entries: OpenCodeModelEntry[]): {
 
   // No relevant models detected — fallback
   return {
-    quotaPoolId: "00000000-0000-0000-0000-000000000004",
+    quotaPoolId: resolvePoolId("free"),
     poolName: "Unknown",
     confidence: 0.3,
   };

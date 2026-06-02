@@ -9,12 +9,15 @@
  *     other sensitive user data.
  *   - All output is passed through sanitize() before returning.
  */
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import fs from "node:fs";
-import path from "node:path";
 import os from "node:os";
+import path from "node:path";
 import crypto from "node:crypto";
 import type { QuotaPoolSnapshot, ToolInfo } from "../payload";
 import { sanitize } from "../sanitizer";
+import { resolvePoolId } from "../pool-map";
 
 export interface HermesCollectorResult {
   snapshots: QuotaPoolSnapshot[];
@@ -31,25 +34,25 @@ interface PoolMapping {
 }
 
 const POOL_OPENCODE_GO: PoolMapping = {
-  quotaPoolId: "00000000-0000-0000-0000-000000000002",
+  quotaPoolId: resolvePoolId("tokens"),
   poolName: "OpenCode Go",
   confidence: 0.8,
 };
 
 const POOL_OPENAI: PoolMapping = {
-  quotaPoolId: "00000000-0000-0000-0000-000000000003",
+  quotaPoolId: resolvePoolId("api_calls"),
   poolName: "OpenAI Provider",
   confidence: 0.7,
 };
 
 const POOL_FREE: PoolMapping = {
-  quotaPoolId: "00000000-0000-0000-0000-000000000004",
+  quotaPoolId: resolvePoolId("free"),
   poolName: "Free",
   confidence: 0.5,
 };
 
 const POOL_UNKNOWN: PoolMapping = {
-  quotaPoolId: "00000000-0000-0000-0000-000000000004",
+  quotaPoolId: resolvePoolId("free"),
   poolName: "Unknown",
   confidence: 0.3,
 };

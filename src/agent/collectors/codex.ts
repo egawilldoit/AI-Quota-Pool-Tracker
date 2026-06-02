@@ -19,9 +19,9 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { QuotaPoolSnapshot, ToolInfo } from "../payload";
 import { sanitize } from "../sanitizer";
+import { resolvePoolId } from "../pool-map";
 
 const execFileAsync = promisify(execFile);
-const CODEX_CHATGPT_POOL_ID = "00000000-0000-0000-0000-000000000001";
 
 export interface CodexCollectorResult {
   snapshots: QuotaPoolSnapshot[];
@@ -45,7 +45,7 @@ function classifyModel(model: string): { confidence: number; poolId: string } {
   );
   return {
     confidence: isPaid ? 0.9 : 0.7,
-    poolId: CODEX_CHATGPT_POOL_ID,
+    poolId: resolvePoolId("credits"),
   };
 }
 

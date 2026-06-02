@@ -29,6 +29,7 @@
 
 import { runAllCollectors } from "../src/agent/collectors/index";
 import { printPrivacyReport } from "../src/agent/privacy-report";
+import { savePoolMappings, loadPoolMappings } from "../src/agent/pool-map";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -235,6 +236,37 @@ async function cmdRegister(): Promise<void> {
       body.device?.deviceFingerprint ?? deriveDeviceFingerprint(deviceName, osValue),
     deviceName: body.device?.label ?? deviceName,
   });
+
+  // ── Fetch and save pool mappings ──────────────────────────────
+  try {
+    const poolResp = await fetch(`${apiBaseUrl}/api/workspaces`, {
+      headers: authHeaders(body.deviceToken),
+    });
+    if (poolResp.ok) {
+      const wsData = (await poolResp.json()) as { workspaces?: { id: string }[] };
+      const wsId = wsData.workspaces?.[0]?.id;
+      if (wsId) {
+        const poolsResp = await fetch(`${apiBaseUrl}/api/workspaces/${wsId}/quota-pools`, {
+          headers: authHeaders(body.deviceToken),
+        });
+        if (poolsResp.ok) {
+          const poolsData = (await poolsResp.json()) as { pools?: { id: string; kind: string; displayName: string }[] };
+          if (poolsData.pools && poolsData.pools.length > 0) {
+            const mappings = poolsData.pools.map((p) => ({
+              quotaPoolId: p.id,
+              kind: p.kind,
+              displayName: p.displayName,
+            }));
+            savePoolMappings(mappings);
+            console.log(`[agent] Saved ${mappings.length} quota pool mappings.`);
+          }
+        }
+      }
+    }
+  } catch {
+    // Non-critical — collectors will use fallback pool IDs
+    console.warn("[agent] Warning: could not fetch pool mappings. Collectors will use fallback pool IDs.");
+  }
 
   console.log("[agent] Device registered. Device token saved locally.");
   console.log(`[agent] Config: ${configPath()}`);
