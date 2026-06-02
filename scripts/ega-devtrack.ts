@@ -4,6 +4,7 @@
  * ega-devtrack — AI Quota Pool Tracker agent CLI.
  *
  * Commands:
+ *   register --token TOKEN   Register this device and save device token locally
  *   once --dry-run           Run collectors and print normalized payload (no upload)
  *   once --upload            Run collectors and upload payload to server
  *   privacy-report           Print what's uploaded vs never uploaded
@@ -30,8 +31,9 @@ import { runAllCollectors } from "../src/agent/collectors/index";
 import { printPrivacyReport } from "../src/agent/privacy-report";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { execSync } from "node:child_process";
+import crypto from "node:crypto";
 import { writeSpool, readSpool, deleteSpoolEntry, getSpoolHealth } from "../src/agent/spool";
 
 const args = process.argv.slice(2);
@@ -41,6 +43,7 @@ function showHelp(): void {
   ega-devtrack — AI Quota Pool Tracker Agent
 
   USAGE:
+    ega-devtrack register --token TOKEN  Register this device with server
     ega-devtrack once --dry-run         Collect & print normalized payload (no upload)
     ega-devtrack once --upload          Collect, upload to server, retry spooled items
     ega-devtrack privacy-report         Print privacy report
@@ -63,6 +66,7 @@ function showHelp(): void {
 
   ENVIRONMENT:
     DEVTRAK_API_URL   API endpoint for upload (default: http://localhost:3000)
+    DEVTRAK_DEVICE_TOKEN  Optional device token override for upload auth
 
   SCHEDULER (install / uninstall / status):
     Linux: Creates systemd user service + timer units at
@@ -70,9 +74,7 @@ function showHelp(): void {
            and enables them with \`systemctl --user\`.
            The timer triggers \`ega-devtrack once\` every 15 minutes.
 
-           NOTE: The 'once' command currently requires --dry-run,
-           so scheduled runs will fail until upload mode is implemented.
-           This is a known limitation.
+           Scheduled runs upload with saved registration token.
 
     Windows: Not yet supported (cross-platform support planned).
 
@@ -83,6 +85,8 @@ function showHelp(): void {
 
   EXAMPLES:
     ega-devtrack once --dry-run
+    ega-devtrack register --token <bootstrap-token>
+    ega-devtrack once --upload
     ega-devtrack privacy-report
     ega-devtrack install
     ega-devtrack status
@@ -115,6 +119,127 @@ function getDataDir(): string {
   return join(homedir(), ".local", "share", "ega-devtrack");
 }
 
+type AgentConfig = {
+  apiBaseUrl?: string;
+  deviceToken?: string;
+  deviceFingerprint?: string;
+  deviceName?: string;
+};
+
+function configPath(): string {
+  return join(getDataDir(), "config.json");
+}
+
+function ensureDataDir(): void {
+  if (!existsSync(getDataDir())) {
+    mkdirSync(getDataDir(), { recursive: true });
+  }
+}
+
+function readAgentConfig(): AgentConfig {
+  try {
+    if (!existsSync(configPath())) return {};
+    return JSON.parse(readFileSync(configPath(), "utf-8")) as AgentConfig;
+  } catch {
+    return {};
+  }
+}
+
+function writeAgentConfig(config: AgentConfig): void {
+  ensureDataDir();
+  writeFileSync(configPath(), JSON.stringify(config, null, 2), { encoding: "utf-8", mode: 0o600 });
+}
+
+function argValue(name: string): string | null {
+  const index = args.indexOf(name);
+  if (index === -1) return null;
+  const value = args[index + 1];
+  return value && !value.startsWith("--") ? value : null;
+}
+
+function getApiBaseUrl(config = readAgentConfig()): string {
+  return (
+    argValue("--endpoint") ??
+    process.env.DEVTRAK_API_URL ??
+    config.apiBaseUrl ??
+    "http://localhost:3000"
+  ).replace(/\/+$/, "");
+}
+
+function deriveDeviceFingerprint(deviceName: string, osValue: string): string {
+  return crypto
+    .createHash("sha256")
+    .update(`${deviceName}:${osValue}:ega-devtrack`)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+function getDeviceName(): string {
+  return argValue("--device-name") ?? process.env.DEVTRAK_DEVICE_NAME ?? `${process.platform}-${crypto.createHash("sha256").update(homedir()).digest("hex").slice(0, 8)}`;
+}
+
+function getDeviceToken(config = readAgentConfig()): string | null {
+  return process.env.DEVTRAK_DEVICE_TOKEN ?? config.deviceToken ?? null;
+}
+
+function authHeaders(token: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+  };
+}
+
+async function cmdRegister(): Promise<void> {
+  const bootstrapToken = argValue("--token") ?? process.env.DEVTRAK_BOOTSTRAP_TOKEN;
+  if (!bootstrapToken) {
+    console.error("ERROR: register requires --token or DEVTRAK_BOOTSTRAP_TOKEN.");
+    process.exit(1);
+  }
+
+  const config = readAgentConfig();
+  const apiBaseUrl = getApiBaseUrl(config);
+  const deviceName = getDeviceName();
+  const osValue = process.platform;
+  const response = await fetch(`${apiBaseUrl}/api/devices/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      bootstrapToken,
+      deviceName,
+      os: osValue,
+      agentVersion: "0.1.0",
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "unknown");
+    console.error(`ERROR: registration failed (HTTP ${response.status}): ${text}`);
+    process.exit(1);
+  }
+
+  const body = (await response.json()) as {
+    device?: { deviceFingerprint?: string; label?: string };
+    deviceToken?: string;
+  };
+
+  if (!body.deviceToken) {
+    console.error("ERROR: registration response missing device token.");
+    process.exit(1);
+  }
+
+  writeAgentConfig({
+    ...config,
+    apiBaseUrl,
+    deviceToken: body.deviceToken,
+    deviceFingerprint:
+      body.device?.deviceFingerprint ?? deriveDeviceFingerprint(deviceName, osValue),
+    deviceName: body.device?.label ?? deviceName,
+  });
+
+  console.log("[agent] Device registered. Device token saved locally.");
+  console.log(`[agent] Config: ${configPath()}`);
+}
+
 function serviceUnitPath(): string {
   return join(getUserConfigDir(), "ega-devtrack.service");
 }
@@ -138,7 +263,7 @@ Documentation=https://github.com/egawilldoit/AI-Quota-Pool-Tracker
 
 [Service]
 Type=oneshot
-ExecStart=${cliJs} once --dry-run
+ExecStart=${cliJs} once --upload
 WorkingDirectory=${workDir}
 StandardOutput=journal
 StandardError=journal
@@ -235,9 +360,7 @@ async function cmdInstall(): Promise<void> {
   console.log("  Timer:  ega-devtrack.timer");
   console.log("  Service: ega-devtrack.service");
   console.log("  Schedule: every 15 minutes\n");
-  console.log("  NOTE: The 'once' command currently requires --dry-run.");
-  console.log("  Scheduled runs will log collection data to journal but");
-  console.log("  will NOT upload until upload mode is implemented.");
+  console.log("  Scheduled runs upload to DEVTRAK_API_URL or saved endpoint.");
   console.log("  Check status with: ega-devtrack status\n");
 }
 
@@ -436,6 +559,11 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  if (command === "register") {
+    await cmdRegister();
+    process.exit(0);
+  }
+
   if (command === "install") {
     await cmdInstall();
     process.exit(0);
@@ -466,7 +594,13 @@ async function main(): Promise<void> {
 
     if (isDryRun) {
       // ── Dry Run Mode ───────────────────────────────────────
-      const result = await runAllCollectors();
+      const config = readAgentConfig();
+      const result = await runAllCollectors({
+        deviceFingerprint:
+          config.deviceFingerprint ?? deriveDeviceFingerprint(getDeviceName(), process.platform),
+        agentVersion: "0.1.0",
+        os: process.platform,
+      });
 
       const output = {
         dryRun: true,
@@ -487,7 +621,16 @@ async function main(): Promise<void> {
     }
 
     // ── Upload Mode ──────────────────────────────────────────
-    const apiBaseUrl = process.env.DEVTRAK_API_URL ?? "http://localhost:3000";
+    const config = readAgentConfig();
+    const deviceToken = getDeviceToken(config);
+    if (!deviceToken) {
+      console.error(
+        "ERROR: Device not registered. Run: ega-devtrack register --token <bootstrap-token>",
+      );
+      process.exit(1);
+    }
+
+    const apiBaseUrl = getApiBaseUrl(config);
     const uploadUrl = `${apiBaseUrl.replace(/\/+$/, "")}/api/ingest`;
 
     console.log(`[agent] Upload mode — endpoint: ${uploadUrl}`);
@@ -500,7 +643,7 @@ async function main(): Promise<void> {
         try {
           const response = await fetch(uploadUrl, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: authHeaders(deviceToken),
             body: JSON.stringify(entry.payload),
           });
 
@@ -533,7 +676,12 @@ async function main(): Promise<void> {
     }
 
     // Step 2: Collect fresh data
-    const collectorResult = await runAllCollectors();
+    const collectorResult = await runAllCollectors({
+      deviceFingerprint:
+        config.deviceFingerprint ?? deriveDeviceFingerprint(getDeviceName(), process.platform),
+      agentVersion: "0.1.0",
+      os: process.platform,
+    });
     console.log(
       `[agent] Collected data: ${collectorResult.collectorsRun} collectors run, ${collectorResult.collectorsFailed} failed`,
     );
@@ -546,7 +694,7 @@ async function main(): Promise<void> {
     try {
       const response = await fetch(uploadUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(deviceToken),
         body: JSON.stringify(collectorResult.payload),
       });
 

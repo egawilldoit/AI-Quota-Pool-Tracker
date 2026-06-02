@@ -1,11 +1,12 @@
 /**
- * Codex collector — detects local Codex CLI installation and reads model
- * metadata from ~/.codex/config.toml (model name only) to produce a
- * normalized QuotaPoolSnapshot and ToolInfo entry.
+ * Codex collector — detects local Codex CLI installation, reads safe model
+ * metadata from ~/.codex/config.toml, and attempts a safe `codex status`
+ * usage parse when the CLI supports it.
  *
  * PRIVACY SAFEGUARDS:
- *   - Reads ONLY ~/.codex/config.toml (model name, reasoning effort, etc.)
+ *   - Reads ONLY ~/.codex/config.toml (model name only)
  *   - NEVER reads ~/.codex/auth.json (contains tokens)
+ *   - Runs only `codex status` / `codex status --json`; never sends prompts.
  *   - NEVER uploads prompts, completions, source code, session contents,
  *     shell history, file names, auth tokens, API keys, or cookies.
  *   - All output is passed through sanitize() before returning.
@@ -14,8 +15,13 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { QuotaPoolSnapshot, ToolInfo } from "../payload";
 import { sanitize } from "../sanitizer";
+
+const execFileAsync = promisify(execFile);
+const CODEX_CHATGPT_POOL_ID = "00000000-0000-0000-0000-000000000001";
 
 export interface CodexCollectorResult {
   snapshots: QuotaPoolSnapshot[];
@@ -39,7 +45,7 @@ function classifyModel(model: string): { confidence: number; poolId: string } {
   );
   return {
     confidence: isPaid ? 0.9 : 0.7,
-    poolId: "Codex-ChatGPT",
+    poolId: CODEX_CHATGPT_POOL_ID,
   };
 }
 
@@ -88,6 +94,83 @@ function readCodexConfig(): { model: string; configDir: string } | null {
   }
 }
 
+type CodexStatusUsage = {
+  usageAmount: number;
+  source: "codex-status";
+  confidence: number;
+  resetText?: string;
+};
+
+function parseCodexStatusText(stdout: string): CodexStatusUsage | null {
+  const percentMatch = stdout.match(/(\d+(?:\.\d+)?)\s*%/);
+  if (!percentMatch) return null;
+
+  const usageAmount = Number(percentMatch[1]);
+  if (!Number.isFinite(usageAmount)) return null;
+
+  const resetMatch = stdout.match(/reset(?:s|ting)?(?:\s+at|\s+in|:)?\s*([^\n]+)/i);
+  return {
+    usageAmount,
+    source: "codex-status",
+    confidence: 0.75,
+    resetText: resetMatch?.[1]?.trim(),
+  };
+}
+
+function parseCodexStatusJson(stdout: string): CodexStatusUsage | null {
+  try {
+    const parsed = JSON.parse(stdout) as Record<string, unknown>;
+    const candidates = [
+      parsed.usagePercent,
+      parsed.usage_percentage,
+      parsed.percentUsed,
+      parsed.percent_used,
+      parsed.creditsUsedPercent,
+      parsed.credits_used_percent,
+    ];
+    const usageAmount = candidates.find((value) => typeof value === "number");
+    if (typeof usageAmount !== "number" || !Number.isFinite(usageAmount)) {
+      return null;
+    }
+    return {
+      usageAmount,
+      source: "codex-status",
+      confidence: 0.85,
+      resetText:
+        typeof parsed.resetAt === "string"
+          ? parsed.resetAt
+          : typeof parsed.reset_at === "string"
+            ? parsed.reset_at
+            : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readCodexStatusUsage(): Promise<CodexStatusUsage | null> {
+  const options = {
+    timeout: 10_000,
+    maxBuffer: 128 * 1024,
+    env: { ...process.env, CODEX_UNTRUSTED: "1" },
+  };
+
+  try {
+    const result = await execFileAsync("codex", ["status", "--json"], options);
+    const parsed = parseCodexStatusJson(result.stdout);
+    if (parsed) return parsed;
+  } catch {
+    // Older Codex builds may not support JSON status.
+  }
+
+  try {
+    const result = await execFileAsync("codex", ["status"], options);
+    return parseCodexStatusText(result.stdout);
+  } catch {
+    return null;
+  }
+}
+
 export async function collectCodex(): Promise<CodexCollectorResult> {
   const now = new Date();
   const windowStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -121,6 +204,7 @@ export async function collectCodex(): Promise<CodexCollectorResult> {
   }
 
   const { confidence, poolId } = classifyModel(config.model);
+  const statusUsage = await readCodexStatusUsage();
 
   const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 
@@ -128,12 +212,12 @@ export async function collectCodex(): Promise<CodexCollectorResult> {
     {
       quotaPoolId: poolId,
       windowName: `${monthKey}-monthly`,
-      usageAmount: 0,
+      usageAmount: statusUsage?.usageAmount ?? 0,
       windowStart: windowStart.toISOString(),
       windowEnd: windowEnd.toISOString(),
       idempotencyKey: `codex-${poolId}-${monthKey}`,
-      source: "heartbeat",
-      confidence,
+      source: statusUsage?.source ?? "heartbeat",
+      confidence: statusUsage?.confidence ?? confidence,
     },
   ];
 
@@ -145,6 +229,8 @@ export async function collectCodex(): Promise<CodexCollectorResult> {
       metadata: JSON.stringify({
         detected: true,
         model: config.model,
+        usageStatus: statusUsage ? "codex_status" : "unknown",
+        resetText: statusUsage?.resetText,
       }),
     },
   ];
@@ -152,6 +238,7 @@ export async function collectCodex(): Promise<CodexCollectorResult> {
   const rawMetadata: Record<string, unknown> = {
     model: config.model,
     toolType: "codex",
+    usageStatus: statusUsage ? "codex_status" : "unknown",
   };
 
   const result: CodexCollectorResult = {

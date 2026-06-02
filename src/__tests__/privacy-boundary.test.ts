@@ -42,6 +42,22 @@ function assertNoSecrets(value: unknown, path_: string = "root"): void {
   }
 }
 
+function assertNoForbiddenKeys(value: unknown, path_: string = "root"): void {
+  const forbidden = /(^|_)(auth|apiKey|api_key|token|cookie|prompt|completion|sourceCode|source_code|history)(_|$)/i;
+  if (Array.isArray(value)) {
+    value.forEach((item, i) => assertNoForbiddenKeys(item, `${path_}[${i}]`));
+    return;
+  }
+  if (typeof value === "object" && value !== null) {
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      if (forbidden.test(key)) {
+        throw new Error(`Forbidden key found at ${path_}.${key}`);
+      }
+      assertNoForbiddenKeys(val, `${path_}.${key}`);
+    }
+  }
+}
+
 // ── COLLECTOR FIXTURE TESTS ─────────────────────────────────────
 
 describe("Collector fixture privacy boundaries", () => {
@@ -79,6 +95,42 @@ describe("Collector fixture privacy boundaries", () => {
       },
     });
     expect(() => assertNoSecrets(codexFixture)).not.toThrow();
+    expect(() => assertNoForbiddenKeys(codexFixture)).not.toThrow();
+  });
+
+  it("Codex normalized payload never carries auth/token fields", () => {
+    const payload = sanitize({
+      quotaPoolSnapshots: [
+        {
+          quotaPoolId: "00000000-0000-0000-0000-000000000001",
+          windowName: "2026-06-monthly",
+          usageAmount: 65,
+          windowStart: "2026-06-01T00:00:00.000Z",
+          windowEnd: "2026-06-30T23:59:59.000Z",
+          idempotencyKey: "codex-00000000-0000-0000-0000-000000000001-2026-06",
+          source: "codex-status",
+          confidence: 0.75,
+        },
+      ],
+      toolInfos: [
+        {
+          toolType: "codex",
+          displayName: "Codex CLI",
+          agentFingerprint: "codex-fake-fingerprint",
+          metadata: JSON.stringify({
+            detected: true,
+            model: "gpt-5.5",
+            usageStatus: "codex_status",
+          }),
+        },
+      ],
+    });
+
+    const serialized = JSON.stringify(payload);
+    expect(serialized).not.toContain("auth.json");
+    expect(serialized).not.toContain("access_token");
+    expect(serialized).not.toContain("refresh_token");
+    expect(() => assertNoForbiddenKeys(payload)).not.toThrow();
   });
 
   it("Codex collector fixture — secret-like data gets sanitized", () => {
@@ -117,6 +169,7 @@ describe("Collector fixture privacy boundaries", () => {
           metadata: JSON.stringify({
             version: "detected",
             pool: "OpenCode Go",
+            usageStatus: "unknown_manual_required",
             modelsCount: 3,
             detectedProviders: ["opencode-go", "openai"],
           }),
@@ -127,9 +180,14 @@ describe("Collector fixture privacy boundaries", () => {
         modelsCount: 3,
         detectedProviders: ["opencode-go", "openai"],
         classifiedPool: "OpenCode Go",
+        usageStatus: "unknown_manual_required",
       },
     });
     expect(() => assertNoSecrets(opencodeFixture)).not.toThrow();
+    expect(() => assertNoForbiddenKeys(opencodeFixture)).not.toThrow();
+    expect(JSON.parse(opencodeFixture.toolInfos[0].metadata).usageStatus).toBe(
+      "unknown_manual_required",
+    );
   });
 
   it("OpenCode fixture — config file paths and raw settings are sanitized", () => {

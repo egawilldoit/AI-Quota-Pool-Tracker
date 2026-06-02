@@ -44,7 +44,8 @@ export function toDashboardState<TPool extends SeedPoolShape, TDevice>(
     status: "loaded" as const,
     workspace: {
       ...workspace,
-      isDemoSeed: workspace.isDemoSeed ?? isDemoSeedPoolSet(pools),
+      isDemoSeed:
+        workspace.isDemoSeed ?? (devices.length === 0 && isDemoSeedPoolSet(pools)),
     },
     pools,
     devices,

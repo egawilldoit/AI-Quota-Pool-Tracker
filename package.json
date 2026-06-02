@@ -15,6 +15,7 @@
     "db:seed": "tsx --env-file=.env.local scripts/seed.ts",
     "typecheck": "tsc --noEmit",
     "agent:dry-run": "node scripts/ega-devtrack.js once --dry-run",
+    "agent:upload": "node scripts/ega-devtrack.js once --upload",
     "agent:privacy-report": "node scripts/ega-devtrack.js privacy-report",
     "agent:help": "node scripts/ega-devtrack.js --help",
     "agent:install": "node scripts/ega-devtrack.js install",
