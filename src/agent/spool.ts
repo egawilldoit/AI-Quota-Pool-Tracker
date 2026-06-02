@@ -50,6 +50,7 @@ const SPOOL_DIR = join(homedir(), ".local", "share", "ega-devtrack", "spool");
 const MAX_ENTRY_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_ENTRIES = 100;
 const MAX_TOTAL_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
+const MAX_RETRY_COUNT = 3; // Max retries before permanent rejection
 
 // ── Internal helpers ───────────────────────────────────────────────────
 
@@ -183,7 +184,8 @@ export function writeSpool(payload: IngestPayload): string | null {
 /**
  * Read all unprocessed spool entries, sorted oldest-first.
  *
- * Also cleans entries older than 7 days and removes corrupted files.
+ * Also cleans entries older than 7 days, removes corrupted files,
+ * and moves entries with too many retries to the rejected directory.
  *
  * @returns Array of spool entries (never null/undefined).
  */
@@ -197,16 +199,28 @@ export function readSpool(): SpoolEntry[] {
   for (const filename of readdirSync(SPOOL_DIR)) {
     if (!filename.endsWith(".json")) continue;
     const entry = loadSpoolFile(filename);
-    if (entry) {
-      entries.push(entry);
-    } else {
+    if (!entry) {
       // Corrupted file — remove it
       try {
         unlinkSync(join(SPOOL_DIR, filename));
       } catch {
         // best-effort
       }
+      continue;
     }
+
+    // Entries with too many retries → reject permanently
+    if (entry.retryCount >= MAX_RETRY_COUNT) {
+      try {
+        unlinkSync(join(SPOOL_DIR, filename));
+        console.warn(`[spool] Entry ${entry.id} rejected after ${entry.retryCount} retries.`);
+      } catch {
+        // best-effort
+      }
+      continue;
+    }
+
+    entries.push(entry);
   }
 
   // Sort oldest first

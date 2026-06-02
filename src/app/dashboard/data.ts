@@ -12,6 +12,8 @@ type SeedPoolShape = {
   usageCurrent: { usageAmount: string } | null;
 };
 
+type GenericDevice = { id: string } & Record<string, unknown>;
+
 export function isDemoSeedPoolSet(pools: SeedPoolShape[]): boolean {
   const codexSeed = pools.some(
     (pool) =>
@@ -31,7 +33,33 @@ export function isDemoSeedPoolSet(pools: SeedPoolShape[]): boolean {
   return codexSeed && opencodeSeed;
 }
 
-export function toDashboardState<TPool extends SeedPoolShape, TDevice>(
+/**
+ * Determine whether a set of pools still looks exactly like the demo seed data.
+ * Replaces the workspace's `isDemoSeed` with a fresh check that accounts for:
+ * - real registered devices overwriting demo
+ * - real usage_current_state overwriting seed percentages
+ * - any agent heartbeats existing
+ */
+export function computeIsDemoSeed(
+  workspaceIsDemoSeed: boolean | undefined,
+  devices: GenericDevice[],
+  pools: SeedPoolShape[],
+): boolean {
+  // If real devices exist, it's not demo regardless of seed data
+  if (devices.length > 0) return false;
+
+  // If no pools exist yet, defer to the API's seed flag
+  if (pools.length === 0) return workspaceIsDemoSeed ?? true;
+
+  // If any pool's current state differs from the exact seed values,
+  // real data has been ingested — not demo
+  if (!isDemoSeedPoolSet(pools)) return false;
+
+  // Default to the API's seed flag if nothing else overrides
+  return workspaceIsDemoSeed ?? true;
+}
+
+export function toDashboardState<TPool extends SeedPoolShape, TDevice extends GenericDevice>(
   workspace: DashboardWorkspace,
   pools: TPool[],
   devices: TDevice[],
@@ -44,8 +72,7 @@ export function toDashboardState<TPool extends SeedPoolShape, TDevice>(
     status: "loaded" as const,
     workspace: {
       ...workspace,
-      isDemoSeed:
-        workspace.isDemoSeed ?? (devices.length === 0 && isDemoSeedPoolSet(pools)),
+      isDemoSeed: computeIsDemoSeed(workspace.isDemoSeed, devices, pools),
     },
     pools,
     devices,
