@@ -73,6 +73,14 @@ interface CodexUsageResult {
   confidence: number;
 }
 
+export interface CodexManualInput {
+  fiveHourRemainingPct: number;
+  weeklyRemainingPct: number;
+  creditsRemaining: number;
+  fiveHourReset?: string;
+  weeklyReset?: string;
+}
+
 // ── Helpers ───────────────────────────────────────────────────
 
 function classifyModel(model: string): { confidence: number; poolId: string } {
@@ -430,6 +438,40 @@ function buildSnapshots(
       confidence,
     };
   });
+}
+
+export function buildCodexManualSnapshots(input: CodexManualInput): QuotaPoolSnapshot[] {
+  const now = new Date();
+  const poolId = resolvePoolId("credits");
+  const snapshots = buildSnapshots(
+    [
+      {
+        windowName: "5h",
+        usedPct: Math.max(0, Math.min(100, 100 - input.fiveHourRemainingPct)),
+        remainingPct: input.fiveHourRemainingPct,
+        resetText: input.fiveHourReset,
+      },
+      {
+        windowName: "weekly",
+        usedPct: Math.max(0, Math.min(100, 100 - input.weeklyRemainingPct)),
+        remainingPct: input.weeklyRemainingPct,
+        resetText: input.weeklyReset,
+      },
+      {
+        windowName: "credits",
+        usedPct: Math.max(0, input.creditsRemaining),
+      },
+    ],
+    poolId,
+    "manual_codex",
+    0.95,
+    now,
+  );
+
+  return snapshots.map((snapshot) => ({
+    ...snapshot,
+    idempotencyKey: snapshot.idempotencyKey.replace("manual_codex", `manual_codex-${now.getTime()}`),
+  }));
 }
 
 function buildDetectionSnapshots(poolId: string, confidence: number, now: Date): QuotaPoolSnapshot[] {

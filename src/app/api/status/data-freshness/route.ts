@@ -105,7 +105,7 @@ export async function GET(request: NextRequest) {
     let mode: string;
     if (deviceCount === 0) {
       mode = "demo";
-    } else if (sources.some((s) => s === "manual" || s === "manual_opencode_go")) {
+    } else if (sources.some((s) => s === "manual" || s === "manual_opencode_go" || s === "manual_codex")) {
       mode = "manual";
     } else if (sources.some((s) => s !== "detected" && s !== "heartbeat" && s !== undefined)) {
       mode = "real";

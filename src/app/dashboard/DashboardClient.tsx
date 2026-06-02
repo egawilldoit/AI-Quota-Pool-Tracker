@@ -32,6 +32,12 @@ import {
   AlertDescription,
 } from "@/components/ui/alert";
 import { toDashboardState } from "./data";
+import {
+  expectedCanonicalWindows,
+  isCanonicalWindowName,
+  isLegacyWindowName,
+  isPercentUsageWindow,
+} from "@/lib/usage-windows";
 
 // ── Types ──────────────────────────────────────────────────────
 
@@ -107,7 +113,9 @@ type PoolAlert = {
 // ── Helpers ────────────────────────────────────────────────────
 
 function usagePercentage(pool: QuotaPoolWithUsage): number | null {
-  if (!pool.usageCurrent) return null;
+  const active = getActiveWindows(pool).find((w) => isPercentUsageWindow(w.windowName) && isUsageKnown(w.usageAmount));
+  if (active) return Number(active.usageAmount);
+  if (!pool.usageCurrent || isPercentUsageWindow(pool.usageCurrent.windowName)) return null;
   const total = Number(pool.totalAllocated);
   if (total <= 0) return 0;
   return Math.min(100, Math.round((Number(pool.usageCurrent.usageAmount) / total) * 100));
@@ -119,6 +127,11 @@ function isUsageKnown(amountStr: string): boolean {
 }
 
 function windowUsagePct(window: UsageWindowData, totalAllocated: string): number | null {
+  if (isPercentUsageWindow(window.windowName)) {
+    const amt = Number(window.usageAmount);
+    if (amt < 0) return null;
+    return Math.min(100, Math.round(amt));
+  }
   const total = Number(totalAllocated);
   if (total <= 0) return null;
   const amt = Number(window.usageAmount);
@@ -136,7 +149,7 @@ function sourceBadge(source: string | null | undefined) {
   if (source === "codex_browser_dashboard") {
     return <Badge variant="default" className="text-[10px]">Browser</Badge>;
   }
-  if (source === "manual" || source === "manual_opencode_go") {
+  if (source === "manual" || source === "manual_opencode_go" || source === "manual_codex") {
     return <Badge variant="secondary" className="text-[10px]">Manual</Badge>;
   }
   if (source === "opencode_go_browser_dashboard") {
@@ -195,6 +208,38 @@ function timeAgo(dateStr: string | null): string {
   const diffHr = Math.floor(diffMin / 60);
   if (diffHr < 24) return `${diffHr}h ago`;
   return `${Math.floor(diffHr / 24)}d ago`;
+}
+
+function unknownWindow(windowName: string): UsageWindowData {
+  const now = new Date().toISOString();
+  return {
+    usageAmount: "-1",
+    windowName,
+    windowStart: now,
+    windowEnd: now,
+    lastUpdatedAt: now,
+    source: null,
+    confidence: null,
+  };
+}
+
+function getAllWindows(pool: QuotaPoolWithUsage): UsageWindowData[] {
+  return pool.usageWindows && pool.usageWindows.length > 0
+    ? pool.usageWindows
+    : (pool.usageCurrent ? [pool.usageCurrent] : []);
+}
+
+function getActiveWindows(pool: QuotaPoolWithUsage): UsageWindowData[] {
+  const windows = getAllWindows(pool);
+  const expected = expectedCanonicalWindows(pool);
+  if (expected.length === 0) return windows.filter((w) => !isLegacyWindowName(w.windowName));
+
+  const byName = new Map(windows.map((w) => [w.windowName, w]));
+  return expected.map((name) => byName.get(name) ?? unknownWindow(name));
+}
+
+function getArchivedWindows(pool: QuotaPoolWithUsage): UsageWindowData[] {
+  return getAllWindows(pool).filter((w) => !isCanonicalWindowName(w.windowName));
 }
 
 // ── Alert Logic ────────────────────────────────────────────────
@@ -278,6 +323,7 @@ function WindowRow({ window: w, pool }: { window: UsageWindowData; pool: QuotaPo
   const pct = windowUsagePct(w, pool.totalAllocated);
   const known = isUsageKnown(w.usageAmount);
   const stale = isStale(w.lastUpdatedAt);
+  const isCreditsRemaining = w.windowName === "codex-credits" && known;
 
   return (
     <div className="rounded-md border p-2.5 space-y-1.5">
@@ -290,15 +336,17 @@ function WindowRow({ window: w, pool }: { window: UsageWindowData; pool: QuotaPo
         </div>
         <div className="flex items-center gap-2">
           {known ? (
-            <span className="text-xs tabular-nums font-semibold">{pct}%</span>
+            <span className="text-xs tabular-nums font-semibold">
+              {isCreditsRemaining ? `${Number(w.usageAmount)} remaining` : `${pct}%`}
+            </span>
           ) : (
-            <span className="text-xs text-muted-foreground">Unknown</span>
+            <span className="text-xs text-muted-foreground">Usage unknown</span>
           )}
           {sourceBadge(w.source)}
         </div>
       </div>
 
-      {known ? (
+      {known && !isCreditsRemaining ? (
         <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted">
           <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${pct ?? 0}%` }} />
         </div>
@@ -320,9 +368,8 @@ function WindowRow({ window: w, pool }: { window: UsageWindowData; pool: QuotaPo
 
 function PoolCard({ pool }: { pool: QuotaPoolWithUsage }) {
   const pct = usagePercentage(pool);
-  const windows = pool.usageWindows && pool.usageWindows.length > 0
-    ? pool.usageWindows
-    : (pool.usageCurrent ? [pool.usageCurrent] : []);
+  const windows = getActiveWindows(pool);
+  const archivedWindows = getArchivedWindows(pool);
 
   const hasWindows = windows.length > 0;
 
@@ -353,6 +400,16 @@ function PoolCard({ pool }: { pool: QuotaPoolWithUsage }) {
             {windows.map((w) => (
               <WindowRow key={w.windowName} window={w} pool={pool} />
             ))}
+            {archivedWindows.length > 0 && (
+              <details className="pt-1 text-xs text-muted-foreground">
+                <summary className="cursor-pointer">Archived/Stale windows ({archivedWindows.length})</summary>
+                <div className="mt-2 space-y-2">
+                  {archivedWindows.map((w) => (
+                    <WindowRow key={`archived-${w.windowName}`} window={w} pool={pool} />
+                  ))}
+                </div>
+              </details>
+            )}
           </div>
         ) : (
           <div className="space-y-1">
