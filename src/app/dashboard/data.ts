@@ -10,6 +10,7 @@ type SeedPoolShape = {
   displayName: string;
   totalAllocated: string;
   usageCurrent: { usageAmount: string } | null;
+  usageWindows?: { usageAmount: string; windowName: string }[];
 };
 
 type GenericDevice = { id: string } & Record<string, unknown>;
@@ -27,7 +28,8 @@ export function isDemoSeedPoolSet(pools: SeedPoolShape[]): boolean {
       pool.accountFingerprint === "opencode-go-tokens" &&
       pool.displayName === "OpenCode Go" &&
       pool.totalAllocated === "5000000" &&
-      pool.usageCurrent === null,
+      // Seed data has null usageCurrent — once we have ANY windows, it's real
+      (!pool.usageCurrent || (pool.usageWindows && pool.usageWindows.length > 0)),
   );
 
   return codexSeed && opencodeSeed;

@@ -12,7 +12,6 @@ import {
   CardFooter,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
@@ -36,6 +35,16 @@ import { toDashboardState } from "./data";
 
 // ── Types ──────────────────────────────────────────────────────
 
+type UsageWindowData = {
+  usageAmount: string;
+  windowName: string;
+  windowStart: string;
+  windowEnd: string;
+  lastUpdatedAt: string;
+  source?: string | null;
+  confidence?: string | null;
+};
+
 type QuotaPoolWithUsage = {
   id: string;
   workspaceId: string;
@@ -44,13 +53,8 @@ type QuotaPoolWithUsage = {
   displayName: string;
   totalAllocated: string;
   rolloverPolicy: string;
-  usageCurrent: {
-    usageAmount: string;
-    windowName: string;
-    windowStart: string;
-    windowEnd: string;
-    lastUpdatedAt: string;
-  } | null;
+  usageCurrent: UsageWindowData | null;
+  usageWindows?: UsageWindowData[];
   source?: string;
   confidence?: string;
 };
@@ -109,12 +113,36 @@ function usagePercentage(pool: QuotaPoolWithUsage): number | null {
   return Math.min(100, Math.round((Number(pool.usageCurrent.usageAmount) / total) * 100));
 }
 
-function usageLabel(pool: QuotaPoolWithUsage): string {
-  if (!pool.usageCurrent) return "Usage unknown";
-  const pct = usagePercentage(pool);
-  const used = Number(pool.usageCurrent.usageAmount);
+/**
+ * Whether the pool has any real usage data (not just detected=0).
+ * Used to distinguish "unknown usage" from "confirmed 0% used".
+ */
+function hasKnownUsage(pool: QuotaPoolWithUsage): boolean {
+  if (!pool.usageCurrent) return false;
+  // If source is heartbeat/unknown and usage is 0, treat as unknown
+  const source = pool.usageCurrent.source ?? pool.source ?? "heartbeat";
+  const usageAmount = Number(pool.usageCurrent.usageAmount);
+  if (usageAmount === 0 && (source === "heartbeat" || source === "unknown" || source === "unknown_manual_required")) {
+    return false;
+  }
+  return true;
+}
+
+function windowUsagePct(pool: QuotaPoolWithUsage, window: UsageWindowData): number | null {
   const total = Number(pool.totalAllocated);
-  return `${pct}% used (${used.toLocaleString()} / ${total.toLocaleString()})`;
+  if (total <= 0) return null;
+  return Math.min(100, Math.round((Number(window.usageAmount) / total) * 100));
+}
+
+function windowResetLabel(window: UsageWindowData): string {
+  const end = new Date(window.windowEnd);
+  const now = new Date();
+  const diffMs = end.getTime() - now.getTime();
+  if (diffMs <= 0) return "Expired";
+  const diffHrs = Math.ceil(diffMs / (1000 * 60 * 60));
+  if (diffHrs < 48) return `${diffHrs}h`;
+  const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+  return `${diffDays}d`;
 }
 
 function resetLabel(policy: string): string {
@@ -147,7 +175,10 @@ function confidenceBadge(pool: QuotaPoolWithUsage) {
 
 function sourceLabel(pool: QuotaPoolWithUsage): string {
   if (!pool.usageCurrent) return "—";
-  if (pool.source === "manual") return "Manual";
+  const src = pool.usageCurrent.source ?? pool.source;
+  if (src === "manual" || src === "manual_opencode_go") return "Manual";
+  if (src === "codex_cli_status" || src === "codex-status") return "CLI";
+  if (src === "heartbeat") return "Detected";
   return "System";
 }
 
@@ -434,40 +465,48 @@ function ErrorState({ message, onRetry }: { message: string; onRetry: () => void
   );
 }
 
-// ── Usage Progress Bar ─────────────────────────────────────────
+// ── Pool Card ──────────────────────────────────────────────────
 
-function UsageBar({ percentage, variant }: { percentage: number | null; variant: "known" | "unknown" }) {
-  if (variant === "unknown") {
-    return (
-      <div className="space-y-1">
-        <div className="relative h-2 w-full overflow-hidden rounded-full bg-muted">
-          <div
-            className="h-full rounded-full bg-muted-foreground/20"
-            style={{ width: "100%" }}
-          />
-        </div>
-        <p className="text-xs text-muted-foreground">Usage data unavailable</p>
-      </div>
-    );
-  }
-
-  const pct = percentage ?? 0;
+function WindowRow({ pool, window: w }: { pool: QuotaPoolWithUsage; window: UsageWindowData }) {
+  const pct = windowUsagePct(pool, w);
+  const sourceLabel_ = w.source ?? pool.source ?? "—";
+  const confidenceLabel = w.confidence ?? pool.confidence;
 
   return (
-    <Progress value={pct}>
-      <span className="flex w-full items-center justify-between gap-2">
-        <span className="text-sm font-medium">Usage</span>
-        <span className="text-sm text-muted-foreground tabular-nums">{pct}%</span>
-      </span>
-    </Progress>
+    <div className="rounded-md border p-2.5 space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs font-medium capitalize">{w.windowName.replace(/-/g, " ")}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs tabular-nums font-semibold">
+            {pct !== null ? `${pct}%` : "—"}
+          </span>
+          {confidenceLabel && (
+            <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+              {Number(confidenceLabel) >= 0.8 ? "High" : Number(confidenceLabel) >= 0.5 ? "Med" : "Low"}
+            </Badge>
+          )}
+        </div>
+      </div>
+      <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-muted">
+        <div
+          className="h-full rounded-full bg-primary transition-all"
+          style={{ width: `${pct ?? 0}%` }}
+        />
+      </div>
+      <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+        <span>{sourceLabel_ !== "—" ? `Source: ${sourceLabel_}` : "Unknown source"}</span>
+        <span>Reset: {windowResetLabel(w)}</span>
+      </div>
+    </div>
   );
 }
 
-// ── Pool Card ──────────────────────────────────────────────────
-
 function PoolCard({ pool }: { pool: QuotaPoolWithUsage }) {
   const pct = usagePercentage(pool);
-  const hasUsage = pool.usageCurrent !== null;
+  const hasUsage = hasKnownUsage(pool);
+  const windows = pool.usageWindows && pool.usageWindows.length > 0
+    ? pool.usageWindows
+    : (pool.usageCurrent ? [pool.usageCurrent] : []);
 
   return (
     <Card>
@@ -488,11 +527,25 @@ function PoolCard({ pool }: { pool: QuotaPoolWithUsage }) {
         </div>
       </CardHeader>
 
-      <CardContent className="space-y-4">
-        <UsageBar percentage={pct} variant={hasUsage ? "known" : "unknown"} />
-
-        {hasUsage && (
-          <p className="text-sm text-muted-foreground">{usageLabel(pool)}</p>
+      <CardContent className="space-y-3">
+        {hasUsage && windows.length > 0 ? (
+          <div className="space-y-2">
+            {windows.map((w) => (
+              <WindowRow key={w.windowName} pool={pool} window={w} />
+            ))}
+          </div>
+        ) : (
+          <div className="space-y-1">
+            <div className="relative h-2 w-full overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-muted-foreground/20"
+                style={{ width: "100%" }}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Usage unknown — run collector or enter manual usage
+            </p>
+          </div>
         )}
 
         <RecordManualUsageDialog pool={pool} />

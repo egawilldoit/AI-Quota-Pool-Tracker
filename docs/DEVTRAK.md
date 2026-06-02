@@ -9,6 +9,7 @@
 
 1. [What Is a Quota Pool?](#what-is-a-quota-pool)
 2. [How Tools Are Tracked](#how-tools-are-tracked)
+   - [Detection vs. Usage Tracking](#detection-vs-usage-tracking)
    - [Codex / ChatGPT](#codex--chatgpt)
    - [OpenCode Go](#opencode-go)
    - [Hermes Agent](#hermes-agent)
@@ -26,6 +27,7 @@
 5. [CLI Commands](#cli-commands)
    - [once --dry-run](#once---dry-run)
    - [once --upload](#once---upload)
+   - [opencode-go manual](#opencode-go-manual)
    - [privacy-report](#privacy-report)
    - [install (Linux)](#install-linux)
    - [install (Windows)](#install-windows)
@@ -41,7 +43,7 @@
 
 ## What Is a Quota Pool?
 
-A **quota pool** is a virtual bucket that tracks consumption of AI credits across tools and time windows. Each pool belongs to a workspace and is identified by a unique UUID. Pools track usage in named windows — for example `2026-06-monthly` — and record the amount consumed, the time boundaries, and a confidence score for the measurement.
+A **quota pool** is a virtual bucket that tracks consumption of AI credits across tools and time windows. Each pool belongs to a workspace and is identified by a unique UUID. Pools track usage in **named windows** — for example `codex-5h`, `opencode-go-weekly` — and record the amount consumed, the time boundaries, and a confidence score for the measurement.
 
 The system supports these built-in pools:
 
@@ -58,31 +60,76 @@ You can create additional custom pools via the [dashboard](/dashboard) for any w
 
 ## How Tools Are Tracked
 
+### Detection vs. Usage Tracking
+
+The DevTrack agent operates at two levels:
+
+1. **Detection** — determines whether a tool is installed and which provider/model it uses. Detection runs automatically on every collector pass. The dashboard shows which tools are detected, but usage data is marked as "unknown" until real usage data arrives.
+
+2. **Usage tracking** — collects real usage percentages from the tool's own status/dashboard. Usage tracking requires the tool to expose a machine-readable status endpoint, or the user to enter values manually.
+
+When usage is unknown, the dashboard displays **"Usage unknown — run collector or enter manual usage"** instead of showing fake 0%.
+
 ### Codex / ChatGPT
 
-The agent detects Codex CLI by reading `~/.codex/config.toml` — specifically the top-level `model = "..."` field (e.g. `gpt-5.5`). It also attempts safe CLI status collection:
+The agent detects Codex CLI by reading `~/.codex/config.toml` — specifically the top-level `model = "..."` field (e.g. `gpt-5.5`).
 
-1. `codex status --json` if supported
-2. `codex status` text parsing as fallback
-3. Model-only heartbeat if no machine-readable usage is available
+#### Collection paths (in priority order):
+
+**A. Safe CLI path (`codex status`):**
+- Runs `codex status` via PTY to collect real usage windows
+- Parses multi-window output:
+  - 5 hour usage limit: `54% remaining` → **46% used**
+  - weekly usage limit: `76% remaining` → **24% used**
+  - credits remaining: `0 of 1000` → **0% used**
+- Source: `codex_cli_status`, confidence: `0.85`
+
+**B. Detection fallback:**
+- When `codex status` cannot run non-interactively (scheduled/cron mode)
+- Emits detection windows (5h, weekly, credits) with usage = unknown (-1)
+- Source: `detected`, confidence: model-based (0.7–0.9)
+- Dashboard shows "Usage unknown" message, not fake 0%
+
+**C. Experimental dashboard path (not yet implemented):**
+- Gated by env flag: `DEVTRACK_EXPERIMENTAL_CODEX_DASHBOARD=1`
+- Requires explicit user opt-in
+- Would scrape Codex Analytics page if auth is configured
+- Never enabled by default
 
 - **Model classification:** Models starting with `gpt-`, `o1`, `o3`, or `o4` are classified as **high-confidence paid** (confidence 0.9) and mapped to the **Codex-ChatGPT** pool.
-- All other models are classified as moderate confidence (0.7).
-- **Usage:** Status parsing records percent-style usage only when the CLI exposes it. Otherwise usage amount is `0` with source `heartbeat`.
 - **Privacy:** Only the model name is read. The agent **never** reads or uploads `~/.codex/auth.json` (contains tokens).
 - If Codex is not installed or config is missing, the agent records a `detected: false` ToolInfo and produces no snapshots.
 
 ### OpenCode Go
 
-The agent runs `opencode models` as a subprocess and parses the model list to detect the active provider.
+The agent runs `opencode models` as a subprocess and parses the model list to detect the active provider. Usage collection currently requires manual entry.
 
-- **Provider classification:**
+#### Collection paths:
+
+**A. Provider detection (automatic):**
+- `opencode models` → classifies by provider prefix
   - Models prefixed `opencode-go/` → **OpenCode Go** pool (confidence 0.8)
   - Models prefixed `openai/` → **OpenAI Provider** pool (confidence 0.7)
   - Models prefixed `opencode/` → **Free** pool (confidence 0.5)
-  - Other providers are ignored — the agent cannot classify them with confidence
-- **Current auth reality:** OpenCode Go uses an API-key style connection flow (`opencode auth` / OpenCode Zen `/connect`). The agent does not read those API keys.
-- **Usage:** No stable official machine-readable OpenCode Go usage endpoint is implemented here. The collector classifies provider/model and marks usage as `unknown_manual_required`.
+- Emits detection windows (rolling, weekly, monthly) with usage = unknown (-1)
+
+**B. Manual entry (CLI):**
+- Enter usage values from the OpenCode Go workspace page
+- Command: `ega-devtrack opencode-go manual --rolling-used-pct N --weekly-used-pct N --monthly-used-pct N [--rolling-reset TEXT] [--weekly-reset TEXT] [--monthly-reset TEXT]`
+- Source: `manual_opencode_go`, confidence: `0.95`
+- Uploads directly to the server (no dry-run mode for manual entry)
+
+**C. Experimental browser path (not yet implemented):**
+- Gated by env flag: `DEVTRACK_EXPERIMENTAL_OPENCODE_GO_USAGE=1`
+- Requires workspace ID: `DEVTRACK_OPENCODE_WORKSPACE_ID=wrk_...`
+- Never enabled by default
+
+**OpenCode Go limitations:**
+- No official machine-readable usage API exists from OpenCode Go
+- `opencode models` does not expose usage data — only model/provider info
+- Manual entry is the primary path for accurate usage tracking
+- The [OpenCode Go workspace page](https://opencode.ai) shows usage visually but has no stable API
+
 - **Privacy:** Only the model names from `opencode models` are parsed. The agent **never** reads `auth.json`, `config.jsonc`, API keys, or any file containing tokens or secrets.
 - If `opencode` is not on `$PATH` or the command fails, the collector returns empty data gracefully.
 
@@ -102,11 +149,12 @@ The agent reads `~/.hermes/config.yaml` to determine the active provider and mod
 
 ### Manual Usage Fallback
 
-When the agent cannot reliably detect usage for a specific tool or provider, users can record usage manually through the web interface:
+When the agent cannot reliably detect usage for a specific tool or provider:
 
-1. Navigate to **Dashboard** → select a workspace → **Manual Usage**
-2. URL pattern: `/workspaces/[workspaceId]/manual-usage/new`
-3. Enter the usage amount, select the quota pool, and optionally add a description.
+1. **For OpenCode Go:** Use `ega-devtrack opencode-go manual` CLI command (see above)
+2. **For other tools:** Navigate to **Dashboard** → select a workspace → **Manual Usage**
+3. URL pattern: `/workspaces/[workspaceId]/manual-usage/new`
+4. Enter the usage amount, select the quota pool, and optionally add a description.
 
 Manual entries are recorded with `source: "manual"` and full confidence (1.0).
 
@@ -131,12 +179,12 @@ These are the exact fields sent to the API endpoint (`POST /api/ingest`):
 | Field                                        | Description                                           |
 |----------------------------------------------|-------------------------------------------------------|
 | `quotaPoolSnapshots[].quotaPoolId`           | UUID of the quota pool on the server                  |
-| `quotaPoolSnapshots[].windowName`            | Usage window label (e.g. `2026-06-monthly`)           |
-| `quotaPoolSnapshots[].usageAmount`           | Numeric usage amount                                  |
+| `quotaPoolSnapshots[].windowName`            | Usage window label (e.g. `codex-5h`, `opencode-go-weekly`) |
+| `quotaPoolSnapshots[].usageAmount`           | Numeric usage amount (-1 = unknown)                   |
 | `quotaPoolSnapshots[].windowStart`           | ISO-8601 start of usage window                        |
 | `quotaPoolSnapshots[].windowEnd`             | ISO-8601 end of usage window                          |
 | `quotaPoolSnapshots[].idempotencyKey`        | Deduplication key                                     |
-| `quotaPoolSnapshots[].source`                | Source label (`heartbeat`, `manual`, `import`)        |
+| `quotaPoolSnapshots[].source`                | Source label (`codex_cli_status`, `detected`, `manual_opencode_go`, `heartbeat`, `manual`, `import`) |
 | `quotaPoolSnapshots[].confidence`            | Confidence score 0–1                                  |
 
 #### Tool Quota Attributions
@@ -153,29 +201,6 @@ These are the exact fields sent to the API endpoint (`POST /api/ingest`):
 | `toolInfos[].displayName`         | Human-readable display name                                  |
 | `toolInfos[].agentFingerprint`    | Stable tool instance identifier                              |
 | `toolInfos[].metadata`            | JSON blob (version, mode, model — **never** raw secrets)     |
-
-#### Codex-Specific Fields
-| Field                        | Description                                                              |
-|------------------------------|--------------------------------------------------------------------------|
-| `codex model name`           | Model name from `~/.codex/config.toml` (e.g. `gpt-5.5`)                  |
-| `codex tool type`            | Tool type identifier `codex` for the Codex CLI                           |
-| `codex detection status`     | Whether Codex CLI and config.toml were detected on the machine           |
-
-#### OpenCode-Specific Fields
-| Field                          | Description                                                                 |
-|--------------------------------|-----------------------------------------------------------------------------|
-| `opencode models list`         | Model names from `opencode models` output                                   |
-| `opencode detected providers`  | Unique provider prefixes parsed from model names                            |
-| `opencode classified pool`     | Quota pool assignment based on detected providers                           |
-| `opencode models count`        | Total number of available models (numeric only)                             |
-
-#### Hermes-Specific Fields
-| Field                         | Description                                               |
-|-------------------------------|-----------------------------------------------------------|
-| `hermes provider`             | Provider name from `config.yaml` delegation section       |
-| `hermes model`                | Model name from `config.yaml` delegation section          |
-| `hermes classified pool`      | Quota pool assignment based on provider/model mapping     |
-| `hermes detection status`     | Whether Hermes `config.yaml` was detected on the machine  |
 
 ### What the Agent NEVER Uploads
 
@@ -194,13 +219,15 @@ The following are **never collected, read, or uploaded**:
 | Raw config files    | Config files may be examined for usage counts only; raw values redacted |
 | Device exact hostname | Fingerprints are hashed/derived, not raw hostnames              |
 | Network info        | No IP addresses, MAC addresses, or network topology               |
+| Browser cookies     | No browser cookies or session data ever uploaded                  |
+| API keys from tools | No Codex auth tokens, OpenCode Zen keys, or Hermes .env secrets   |
 
 ### How Data Is Sanitized
 
 All collected data passes through a `sanitize()` function before being returned by any collector or written to the spool. This function:
 
-- Redacts anything that looks like an API key or token (`sk-*`, `tok_*`, etc.)
-- Strips path information from file references
+- Redacts anything that looks like an API key or token (`sk-*`, `tok_*`, `ghp_*`, etc.)
+- Redacts property names like `apiKey`, `token`, `authorization`, `password`, `bearer`, `auth`
 - Ensures no raw secrets leak into the payload output
 - Runs on both dry-run and upload mode
 
@@ -221,7 +248,7 @@ Create a `.env.local` file in the project root:
 
 ```env
 # Database (PostgreSQL via Supabase or direct connection)
-DATABASE_URL=postgresql://user:password@host:5432/dbname
+DATABASE_URL=postgresql://user:***@host:5432/dbname
 
 # Next.js
 NEXT_PUBLIC_SITE_URL=http://localhost:3000
@@ -269,7 +296,7 @@ The schema includes these tables:
 - `tool_instances` — AI tool/agent registrations
 - `tool_quota_attributions` — Links tools to pools with allocation amounts
 - `usage_snapshots` — Immutable usage records with idempotency keys
-- `usage_current_state` — Materialized current window states (fast-read)
+- `usage_current_state` — Materialized current window states (fast-read), keyed by `workspace_id + quota_pool_id + window_name`
 - `agent_heartbeats` — Agent heartbeat log
 - `bootstrap_tokens` — Device registration tokens
 - `manual_usage_entries` — Manually entered usage records
@@ -293,7 +320,7 @@ The dashboard cannot know local Codex/OpenCode/Hermes usage until a local agent 
 https://ai-quota-pool-tracker.vercel.app/devices/add
 ```
 
-2. Register the device. The bootstrap token is consumed once; the returned device token is saved locally at `~/.local/share/ega-devtrack/config.json`.
+2. Register the device:
 
 ```bash
 DEVTRAK_API_URL=https://ai-quota-pool-tracker.vercel.app \
@@ -312,29 +339,38 @@ node scripts/ega-devtrack.js once --dry-run
 node scripts/ega-devtrack.js once --upload
 ```
 
-5. Install Linux scheduler if wanted.
+5. (Optional) Enter OpenCode Go usage from screenshot:
+
+```bash
+DEVTRAK_API_URL=https://ai-quota-pool-tracker.vercel.app \
+  node scripts/ega-devtrack.js opencode-go manual \
+    --rolling-used-pct 3 \
+    --weekly-used-pct 5 \
+    --monthly-used-pct 14 \
+    --rolling-reset "57 minutes" \
+    --weekly-reset "5 days 11 hours" \
+    --monthly-reset "26 days 8 hours"
+```
+
+6. Install Linux scheduler if wanted.
 
 ```bash
 node scripts/ega-devtrack.js install
 ```
 
-6. Verify dashboard.
+7. Verify dashboard.
 
 ```text
 https://ai-quota-pool-tracker.vercel.app/dashboard
 ```
 
-Expected behavior: demo seed rows remain visible only until real device/current-state data exists. Real `usage_current_state` rows update the quota pool display and the demo banner clears.
-
 ---
 
 ## CLI Commands
 
-All commands are run from the project root. You can use either the compiled JS directly or the npm script shortcuts.
+All commands are run from the project root.
 
 ### once --dry-run
-
-Collect data from all installed tools and print the normalized payload to stdout. **No data is uploaded.**
 
 ```bash
 node scripts/ega-devtrack.js once --dry-run
@@ -342,18 +378,7 @@ node scripts/ega-devtrack.js once --dry-run
 npm run agent:dry-run
 ```
 
-Output is a JSON object with:
-- `dryRun: true` — confirmation that nothing was uploaded
-- `timestamp` — when the collection ran
-- `payload` — the full normalized payload
-- `collectors.run` / `collectors.failed` — collector counts
-- `errors` — any collector errors (if any)
-
-**Always exits 0**, even if collectors fail.
-
 ### once --upload
-
-Collect data and upload to the server. Before collecting fresh data, retries any previously failed uploads from the spool (oldest first).
 
 ```bash
 node scripts/ega-devtrack.js once --upload
@@ -361,34 +386,27 @@ node scripts/ega-devtrack.js once --upload
 npm run agent:upload
 ```
 
-**Flow:**
-1. Retry spooled items → delete on success, increment retry count on failure
-2. Collect fresh data from all collectors
-3. Upload payload to `{DEVTRAK_API_URL}/api/ingest`
-4. On failure: spool the payload to `~/.local/share/ega-devtrack/spool/` for later retry
+### opencode-go manual
 
-**Required:** registered device token, from `ega-devtrack register --token <bootstrap-token>`. The upload sends `Authorization: Bearer <device-token>` to `POST /api/ingest`; token value is never printed.
-
-`DEVTRAK_API_URL` defaults to saved registration endpoint, then `http://localhost:3000`.
-
-### register
-
-Register this local machine against the server using a short-lived bootstrap token from `/devices/add`.
+Enter OpenCode Go usage from the workspace dashboard values:
 
 ```bash
 DEVTRAK_API_URL=https://ai-quota-pool-tracker.vercel.app \
-  node scripts/ega-devtrack.js register --token <bootstrap-token>
+  node scripts/ega-devtrack.js opencode-go manual \
+    --rolling-used-pct N \
+    --weekly-used-pct N \
+    --monthly-used-pct N \
+    [--rolling-reset "57 minutes"] \
+    [--weekly-reset "5 days 11 hours"] \
+    [--monthly-reset "26 days 8 hours"]
 ```
 
-Options:
-- `--endpoint <url>` overrides `DEVTRAK_API_URL`
-- `--device-name <name>` sets the dashboard device label
-
-The command saves only the device token and endpoint locally. It does not upload Codex/OpenCode/Hermes secrets.
+- `--rolling-used-pct`, `--weekly-used-pct`, `--monthly-used-pct` are **required**
+- Reset hints are optional and used to compute window end times
+- Source: `manual_opencode_go`, confidence: `0.95`
+- Uploads directly — no dry-run mode
 
 ### privacy-report
-
-Print a detailed breakdown of what the agent uploads and what it never uploads. Run this to verify the data boundary before enabling scheduled uploads.
 
 ```bash
 node scripts/ega-devtrack.js privacy-report
@@ -398,45 +416,13 @@ npm run agent:privacy-report
 
 ### install (Linux)
 
-Install a systemd user timer that runs `ega-devtrack once --upload` every 15 minutes.
-
 ```bash
 node scripts/ega-devtrack.js install
 # or
 npm run agent:install
 ```
 
-**What it does:**
-1. Ensures systemd user mode is available (`systemctl --user`)
-2. Creates data directory at `~/.local/share/ega-devtrack/`
-3. Writes unit files:
-   - `~/.config/systemd/user/ega-devtrack.service`
-   - `~/.config/systemd/user/ega-devtrack.timer`
-4. Runs `systemctl --user daemon-reload`
-5. Enables and starts the timer: `systemctl --user enable --now ega-devtrack.timer`
-
-**Note:** Run `ega-devtrack register --token <bootstrap-token>` before installing the scheduler.
-
-### install (Windows)
-
-Windows scheduler support is **not yet implemented**. The `install` command on Windows will fail. Status:
-
-```bash
-node scripts/ega-devtrack.js status
-# → "Agent scheduler: NOT AVAILABLE (systemd user mode not found)"
-```
-
-For manual scheduling on Windows, use Task Scheduler to run:
-```powershell
-# Every 15 minutes, run:
-node C:\path\to\project\scripts\ega-devtrack.js once --upload
-```
-
-Cross-platform support (Task Scheduler / launchd) is planned for a future release.
-
 ### uninstall
-
-Remove the systemd scheduler units:
 
 ```bash
 node scripts/ega-devtrack.js uninstall
@@ -444,37 +430,13 @@ node scripts/ega-devtrack.js uninstall
 npm run agent:uninstall
 ```
 
-**What it does:**
-1. Stops and disables the timer
-2. Removes `ega-devtrack.service` and `ega-devtrack.timer` from `~/.config/systemd/user/`
-3. Reloads systemd daemon
-
-**Does not delete** the data directory (`~/.local/share/ega-devtrack/`) — spool data is preserved.
-
 ### status
-
-Show the current scheduler and spool status:
 
 ```bash
 node scripts/ega-devtrack.js status
 # or
 npm run agent:status
 ```
-
-**Output includes:**
-- Unit file existence (service + timer paths)
-- Data directory status
-- Spool health:
-  - Entry count
-  - Total size (KB)
-  - Oldest entry age
-  - Health check (yellow flag if spool exceeds limits)
-- Timer active / enabled state
-- Last trigger time
-- Next trigger time
-- Last run result (exit code)
-
-If the scheduler is not installed, prints a prompt to run `install`.
 
 ### npm Script Shortcuts
 
@@ -498,120 +460,15 @@ A device becomes **stale** when the server hasn't received a heartbeat or upload
 
 **Symptoms:**
 - Device shows "offline" on the devices page (`/devices`)
-- Quota pool usage stops updating
-- `ega-devtrack status` shows that uploads are failing
-
-**Causes & fixes:**
-
-| Cause | Check | Fix |
-|-------|-------|-----|
-| Timer not running | `systemctl --user status ega-devtrack.timer` | `ega-devtrack install` |
-| Network down | Check internet connectivity | Restore connection |
-| Server unreachable | `curl $DEVTRAK_API_URL` | Verify server is running |
-| Spool full | `ega-devtrack status` → spool health | Clear spool: `rm -rf ~/.local/share/ega-devtrack/spool/*` |
-| Token expired | Check `bootstrap_tokens` table | Generate a new bootstrap token |
-| Agent not registered | Check device list at `/devices` | Add device at `/devices/add` |
-
-**To re-register a stale device:**
-1. Go to the dashboard → **Devices** → **Add Device**
-2. Generate a new bootstrap token
-3. Set the token as an env var or pass it to the agent
-4. Run `ega-devtrack register --token <bootstrap-token>`
-5. Run `ega-devtrack once --upload`
+- Dashboard shows "Usage unknown" for all pools
 
 ### Token Revoke / Rotate
 
-If a device token is compromised, lost, or needs to be rotated:
+To rotate a device token: re-register the device. The old token is invalidated and a new one is generated.
 
-1. **Revoke the old token** in the Supabase dashboard → `bootstrap_tokens` table → set `is_active = false` (or delete the row)
-2. **Generate a new token** from the dashboard at `/devices/add`
-3. Register with the new bootstrap token:
-   ```bash
-   node scripts/ega-devtrack.js register --token <bootstrap-token>
-   ```
-4. Test collection:
-   ```bash
-   node scripts/ega-devtrack.js once --dry-run
-   ```
-5. Run an upload:
-   ```bash
-   node scripts/ega-devtrack.js once --upload
-   ```
+### Deferred Features
 
-### Windows Status / Uninstall
-
-On Windows, the `status` command will report:
-```
-Agent scheduler: NOT AVAILABLE (systemd user mode not found)
-```
-
-The `uninstall` command on Windows will also exit with the same error since no systemd units are present. No cleanup is needed.
-
-If you manually set up Task Scheduler entries:
-1. Open **Task Scheduler**
-2. Find the task (e.g. "ega-devtrack")
-3. Right-click → **Disable** or **Delete**
-
-### Linux Scheduler Logs
-
-View agent output:
-```bash
-journalctl --user -u ega-devtrack.service
-```
-
-Follow logs in real time:
-```bash
-journalctl --user -u ega-devtrack.service -f
-```
-
----
-
-## Deferred Features
-
-The following features are planned but **not yet implemented** in the MVP:
-
-- **Token totals display** — aggregate usage across all pools and tools, summed per workspace/month
-- **Working hours tracking** — time-of-day and day-of-week filtering for quota consumption
-- **Windows scheduler** — automatic Task Scheduler integration
-- **macOS scheduler** — launchd plist generation
-- **OpenCode Go usage API** — provider detection works, but usage amount stays manual/unknown until an official machine-readable usage API is available
-
----
-
-## Architecture Overview
-
-```
-┌─────────────────────┐        ┌──────────────────────┐
-│   Codex CLI          │        │   OpenCode CLI       │
-│   ~/.codex/config    │        │   opencode models    │
-└────────┬────────────┘        └──────────┬───────────┘
-         │                                │
-         ▼                                ▼
-┌──────────────────────────────────────────────────────┐
-│              ega-devtrack Agent (CLI)                 │
-│                                                      │
-│  runAllCollectors() → sanitize() → IngestPayload     │
-│                                                      │
-│  Spool: ~/.local/share/ega-devtrack/spool/           │
-│  Timer: systemd (every 15 min)                       │
-└──────────────────────┬───────────────────────────────┘
-                       │ POST /api/ingest
-                       ▼
-┌──────────────────────────────────────────────────────┐
-│              Next.js Server (API)                     │
-│                                                      │
-│  Drizzle ORM → PostgreSQL (Supabase)                 │
-│                                                      │
-│  Tables: quota_pools, usage_snapshots, devices,      │
-│          tool_instances, tool_quota_attributions     │
-└──────────────────────┬───────────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────────┐
-│              Web Dashboard (Next.js)                  │
-│                                                      │
-│  /dashboard     — Overview                           │
-│  /devices/add   — Register device / generate token   │
-│  /workspaces/:id/manual-usage/new — Manual entry     │
-└──────────────────────────────────────────────────────┘
-```
+- Windows Task Scheduler support (`ega-devtrack install` on Windows)
+- Experimental Codex Analytics dashboard scraping (`DEVTRACK_EXPERIMENTAL_CODEX_DASHBOARD=1`)
+- Experimental OpenCode Go workspace scraping (`DEVTRACK_EXPERIMENTAL_OPENCODE_GO_USAGE=1`)
+- Automated OpenCode Go usage collection (blocked on stable usage API from OpenCode Go)

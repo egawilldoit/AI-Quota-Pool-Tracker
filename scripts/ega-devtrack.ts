@@ -47,6 +47,9 @@ function showHelp(): void {
     ega-devtrack register --token TOKEN  Register this device with server
     ega-devtrack once --dry-run         Collect & print normalized payload (no upload)
     ega-devtrack once --upload          Collect, upload to server, retry spooled items
+    ega-devtrack opencode-go manual     Enter OpenCode Go usage from screenshot values
+      --rolling-used-pct N --weekly-used-pct N --monthly-used-pct N
+      [--rolling-reset TEXT] [--weekly-reset TEXT] [--monthly-reset TEXT]
     ega-devtrack privacy-report         Print privacy report
     ega-devtrack install                Install systemd timer (runs every 15 min)
     ega-devtrack uninstall              Remove installed systemd timer & service
@@ -68,6 +71,8 @@ function showHelp(): void {
   ENVIRONMENT:
     DEVTRAK_API_URL   API endpoint for upload (default: http://localhost:3000)
     DEVTRAK_DEVICE_TOKEN  Optional device token override for upload auth
+    DEVTRACK_EXPERIMENTAL_CODEX_DASHBOARD=1  Enable Codex Analytics scraping (experimental)
+    DEVTRACK_EXPERIMENTAL_OPENCODE_GO_USAGE=1  Enable OpenCode Go workspace scraping (experimental)
 
   SCHEDULER (install / uninstall / status):
     Linux: Creates systemd user service + timer units at
@@ -576,6 +581,118 @@ async function cmdStatus(): Promise<void> {
   console.log("  Check `journalctl --user -u ega-devtrack.service` for logs.\n");
 }
 
+// ── OpenCode Go Manual Usage ──────────────────────────────────────
+
+async function cmdOpenCodeGoManual(): Promise<void> {
+  const subcommand = args[1];
+
+  if (subcommand !== "manual") {
+    console.error("ERROR: opencode-go command requires 'manual' subcommand.");
+    console.error("  Usage: ega-devtrack opencode-go manual --rolling-used-pct N --weekly-used-pct N --monthly-used-pct N [--rolling-reset TEXT] [--weekly-reset TEXT] [--monthly-reset TEXT]");
+    process.exit(1);
+  }
+
+  const rollingUsed = argValue("--rolling-used-pct");
+  const weeklyUsed = argValue("--weekly-used-pct");
+  const monthlyUsed = argValue("--monthly-used-pct");
+
+  if (!rollingUsed || !weeklyUsed || !monthlyUsed) {
+    console.error("ERROR: --rolling-used-pct, --weekly-used-pct, and --monthly-used-pct are required.");
+    console.error("  Example: ega-devtrack opencode-go manual --rolling-used-pct 3 --weekly-used-pct 5 --monthly-used-pct 14");
+    process.exit(1);
+  }
+
+  const rollingReset = argValue("--rolling-reset") ?? undefined;
+  const weeklyReset = argValue("--weekly-reset") ?? undefined;
+  const monthlyReset = argValue("--monthly-reset") ?? undefined;
+
+  const rolling = Number(rollingUsed);
+  const weekly = Number(weeklyUsed);
+  const monthly = Number(monthlyUsed);
+
+  if (!Number.isFinite(rolling) || !Number.isFinite(weekly) || !Number.isFinite(monthly)) {
+    console.error("ERROR: usage percentages must be valid numbers.");
+    process.exit(1);
+  }
+
+  const { buildOpenCodeGoManualSnapshots } = await import("../src/agent/collectors/opencode");
+
+  const config = readAgentConfig();
+  const snapshots = buildOpenCodeGoManualSnapshots({
+    rollingUsedPct: rolling,
+    weeklyUsedPct: weekly,
+    monthlyUsedPct: monthly,
+    rollingReset,
+    weeklyReset,
+    monthlyReset,
+  });
+
+  const deviceFingerprint = config.deviceFingerprint ?? deriveDeviceFingerprint(getDeviceName(), process.platform);
+  const { sanitize } = await import("../src/agent/sanitizer");
+
+  const payload = sanitize({
+    device: {
+      deviceFingerprint,
+      agentVersion: "0.1.0",
+      os: process.platform,
+    },
+    quotaPoolSnapshots: snapshots,
+    toolQuotaAttributions: [],
+    toolInfos: [
+      {
+        toolType: "opencode",
+        displayName: "OpenCode CLI (OpenCode Go)",
+        agentFingerprint: `opencode-opencode-go-manual-${deviceFingerprint.slice(0, 8)}`,
+        metadata: JSON.stringify({
+          usageStatus: "manual_confirmed",
+          pool: "OpenCode Go",
+          manualSource: "screenshot",
+        }),
+      },
+    ],
+  });
+
+  // Upload directly
+  const deviceToken = getDeviceToken(config);
+  if (!deviceToken) {
+    console.error("ERROR: Device not registered. Run: ega-devtrack register --token <bootstrap-token>");
+    process.exit(1);
+  }
+
+  const apiBaseUrl = getApiBaseUrl(config);
+  const uploadUrl = `${apiBaseUrl}/api/ingest`;
+
+  console.log(`[agent] Uploading OpenCode Go manual usage to: ${uploadUrl}`);
+  console.log(JSON.stringify({
+    windows: snapshots.map((s) => ({
+      window: s.windowName,
+      usedPct: s.usageAmount,
+      source: s.source,
+      confidence: s.confidence,
+    })),
+  }, null, 2));
+
+  try {
+    const response = await fetch(uploadUrl, {
+      method: "POST",
+      headers: authHeaders(deviceToken),
+      body: JSON.stringify(payload),
+    });
+
+    if (response.ok) {
+      console.log("[agent] Manual OpenCode Go usage uploaded SUCCESS");
+      process.exit(0);
+    } else {
+      const text = await response.text().catch(() => "unknown");
+      console.error(`[agent] Upload FAILED (HTTP ${response.status}): ${text}`);
+      process.exit(1);
+    }
+  } catch (err) {
+    console.error(`[agent] Upload NETWORK ERROR: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
 // ── Main dispatch ────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -608,6 +725,11 @@ async function main(): Promise<void> {
 
   if (command === "status") {
     await cmdStatus();
+    process.exit(0);
+  }
+
+  if (command === "opencode-go") {
+    await cmdOpenCodeGoManual();
     process.exit(0);
   }
 
