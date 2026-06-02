@@ -93,7 +93,7 @@ function computeDataMode(
   // Check if any pool has manual source
   for (const pool of pools) {
     for (const w of pool.usageWindows) {
-      if (w.source === "manual" || w.source === "manual_opencode_go") return "manual";
+      if (w.source === "manual" || w.source === "manual_opencode_go" || w.source === "manual_codex") return "manual";
     }
   }
 

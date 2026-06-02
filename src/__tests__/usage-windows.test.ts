@@ -11,8 +11,10 @@
  */
 import { describe, it, expect } from "vitest";
 import { sanitize } from "../agent/sanitizer";
-import { parseCodexStatusMultiWindow, parseCodexDashboardText } from "../agent/collectors/codex";
-import { parseOpenCodeGoDashboardText, parseResetToMs } from "../agent/collectors/opencode";
+import { buildCodexManualSnapshots, parseCodexStatusMultiWindow, parseCodexDashboardText } from "../agent/collectors/codex";
+import { buildOpenCodeGoManualSnapshots, parseOpenCodeGoDashboardText, parseResetToMs } from "../agent/collectors/opencode";
+import { normalizeSnapshot } from "../lib/ingest-normalize";
+import { activeCanonicalSnapshots, expectedCanonicalWindows, isCanonicalWindowName, isLegacyWindowName } from "../lib/usage-windows";
 
 // ── Codex Status Parsing ──────────────────────────────────────
 
@@ -132,6 +134,53 @@ describe("OpenCode Go dashboard text parser", () => {
   });
 });
 
+// ── Manual Snapshot Builders ──────────────────────────────────
+
+describe("manual provider usage snapshots", () => {
+  it("keeps OpenCode Go manual percentages as 3/5/14 through payload normalization", () => {
+    const snapshots = buildOpenCodeGoManualSnapshots({
+      rollingUsedPct: 3,
+      weeklyUsedPct: 5,
+      monthlyUsedPct: 14,
+      rollingReset: "57 minutes",
+      weeklyReset: "5 days 11 hours",
+      monthlyReset: "26 days 8 hours",
+    });
+
+    const byName = Object.fromEntries(snapshots.map((s) => [s.windowName, s]));
+    expect(byName["opencode-go-rolling"].usageAmount).toBe(3);
+    expect(byName["opencode-go-weekly"].usageAmount).toBe(5);
+    expect(byName["opencode-go-monthly"].usageAmount).toBe(14);
+    expect(byName["opencode-go-rolling"].source).toBe("manual_opencode_go");
+    expect(byName["opencode-go-rolling"].confidence).toBe(0.95);
+
+    const normalized = normalizeSnapshot({
+      quotaPoolId: snapshots[0].quotaPoolId,
+      usageAmount: snapshots[0].usageAmount,
+      confidence: snapshots[0].confidence ?? 0,
+    });
+    expect(typeof normalized).toBe("object");
+    if (typeof normalized === "object") expect(normalized.usageAmount).toBe("3");
+  });
+
+  it("converts Codex manual remaining percentages and preserves zero credits remaining", () => {
+    const snapshots = buildCodexManualSnapshots({
+      fiveHourRemainingPct: 54,
+      weeklyRemainingPct: 76,
+      creditsRemaining: 0,
+      fiveHourReset: "2:44 PM",
+      weeklyReset: "Jun 7, 2026 8:43 PM",
+    });
+
+    const byName = Object.fromEntries(snapshots.map((s) => [s.windowName, s]));
+    expect(byName["codex-5h"].usageAmount).toBe(46);
+    expect(byName["codex-weekly"].usageAmount).toBe(24);
+    expect(byName["codex-credits"].usageAmount).toBe(0);
+    expect(byName["codex-5h"].source).toBe("manual_codex");
+    expect(byName["codex-5h"].confidence).toBe(0.95);
+  });
+});
+
 // ── Reset Duration Parser ─────────────────────────────────────
 
 describe("Reset duration parser", () => {
@@ -166,6 +215,85 @@ describe("Unknown usage vs zero", () => {
     expect(isKnown(-1)).toBe(false);
     expect(isKnown(0)).toBe(true);
     expect(isKnown(46)).toBe(true);
+  });
+
+  it("normalizer preserves -1 unknown sentinel and 0 known value", () => {
+    const unknown = normalizeSnapshot({
+      quotaPoolId: "3439f84d-3515-49b9-b3c3-0e907005d760",
+      usageAmount: -1,
+      confidence: 0.8,
+    });
+    const zero = normalizeSnapshot({
+      quotaPoolId: "3439f84d-3515-49b9-b3c3-0e907005d760",
+      usageAmount: 0,
+      confidence: 0.95,
+    });
+    expect(typeof unknown).toBe("object");
+    expect(typeof zero).toBe("object");
+    if (typeof unknown === "object") expect(unknown.usageAmount).toBe("-1");
+    if (typeof zero === "object") expect(zero.usageAmount).toBe("0");
+  });
+});
+
+// ── Canonical Active Window Selection ─────────────────────────
+
+describe("canonical active window selection", () => {
+  it("excludes legacy 2026-05-31-weekly from canonical active windows", () => {
+    expect(isLegacyWindowName("2026-05-31-weekly")).toBe(true);
+    expect(isCanonicalWindowName("codex-weekly")).toBe(true);
+  });
+
+  it("canonical manual windows override detected unknown windows", () => {
+    const poolId = "3439f84d-3515-49b9-b3c3-0e907005d760";
+    const active = activeCanonicalSnapshots([
+      {
+        quotaPoolId: poolId,
+        windowName: "codex-weekly",
+        usageAmount: -1,
+        windowStart: "2026-06-01T00:00:00.000Z",
+        windowEnd: "2026-06-08T00:00:00.000Z",
+        idempotencyKey: "detect",
+        source: "detected",
+        confidence: 0.8,
+      },
+      {
+        quotaPoolId: poolId,
+        windowName: "codex-weekly",
+        usageAmount: 24,
+        windowStart: "2026-06-01T00:00:00.000Z",
+        windowEnd: "2026-06-08T00:00:00.000Z",
+        idempotencyKey: "manual",
+        source: "manual_codex",
+        confidence: 0.95,
+      },
+      {
+        quotaPoolId: poolId,
+        windowName: "2026-05-31-weekly",
+        usageAmount: 65,
+        windowStart: "2026-05-31T00:00:00.000Z",
+        windowEnd: "2026-06-07T00:00:00.000Z",
+        idempotencyKey: "legacy",
+        source: "manual",
+        confidence: 0.95,
+      },
+    ]);
+
+    expect(active).toHaveLength(1);
+    expect(active[0].windowName).toBe("codex-weekly");
+    expect(active[0].usageAmount).toBe(24);
+  });
+
+  it("returns expected canonical windows for Codex and OpenCode Go pools", () => {
+    expect(expectedCanonicalWindows({ displayName: "Codex & ChatGPT" })).toEqual([
+      "codex-5h",
+      "codex-weekly",
+      "codex-credits",
+    ]);
+    expect(expectedCanonicalWindows({ displayName: "OpenCode Go" })).toEqual([
+      "opencode-go-rolling",
+      "opencode-go-weekly",
+      "opencode-go-monthly",
+    ]);
   });
 });
 
@@ -214,6 +342,16 @@ describe("Sanitizer — no secrets", () => {
     expect(snapshots[0].windowName).toBe("codex-5h");
     expect(snapshots[0].source).toBe("codex_cli_status");
   });
+
+  it("stale cleanup dry-run style output contains safe names only", () => {
+    const result = sanitize({
+      staleWindowCount: 1,
+      deletedCount: 0,
+      windowNames: ["2026-05-31-weekly"],
+    }) as Record<string, unknown>;
+
+    expect(JSON.stringify(result)).toBe('{"staleWindowCount":1,"deletedCount":0,"windowNames":["2026-05-31-weekly"]}');
+  });
 });
 
 // ── Experimental flags: disabled by default ────────────────────
@@ -241,7 +379,7 @@ describe("Data mode detection", () => {
       return "unknown";
     }
 
-    if (sources.some((s) => s === "manual" || s === "manual_opencode_go")) {
+    if (sources.some((s) => s === "manual" || s === "manual_opencode_go" || s === "manual_codex")) {
       return "manual";
     }
 
@@ -266,6 +404,7 @@ describe("Data mode detection", () => {
 
   it("mode=manual when manual source exists", () => {
     expect(computeDataMode(1, ["manual_opencode_go"], false)).toBe("manual");
+    expect(computeDataMode(1, ["manual_codex"], false)).toBe("manual");
     expect(computeDataMode(1, ["manual"], false)).toBe("manual");
   });
 

@@ -52,6 +52,9 @@ function showHelp(): void {
     ega-devtrack uninstall              Remove installed systemd timer & service
     ega-devtrack status                 Show scheduler status
     ega-devtrack verify                 Verify data pipeline freshness
+    ega-devtrack opencode-go manual     Upload manual OpenCode Go usage percentages
+    ega-devtrack codex manual           Upload manual Codex usage windows
+    ega-devtrack cleanup stale-windows  Dry-run/apply current-state stale cleanup
     ega-devtrack --help                 Show this help
 
   OPTIONS:
@@ -663,6 +666,143 @@ async function cmdOpenCodeGoManual(): Promise<void> {
   }
 }
 
+// ── Codex Manual Usage ─────────────────────────────────────────────
+
+async function cmdCodexManual(): Promise<void> {
+  const subcommand = args[1];
+
+  if (subcommand !== "manual") {
+    console.error("ERROR: codex command requires 'manual' subcommand.");
+    console.error("  Usage: ega-devtrack codex manual --five-hour-remaining-pct N --weekly-remaining-pct N --credits-remaining N [--five-hour-reset TEXT] [--weekly-reset TEXT]");
+    process.exit(1);
+  }
+
+  const fiveHourRemaining = argValue("--five-hour-remaining-pct");
+  const weeklyRemaining = argValue("--weekly-remaining-pct");
+  const creditsRemaining = argValue("--credits-remaining");
+
+  if (!fiveHourRemaining || !weeklyRemaining || creditsRemaining === null) {
+    console.error("ERROR: --five-hour-remaining-pct, --weekly-remaining-pct, and --credits-remaining are required.");
+    process.exit(1);
+  }
+
+  const fiveHour = Number(fiveHourRemaining);
+  const weekly = Number(weeklyRemaining);
+  const credits = Number(creditsRemaining);
+
+  if (!Number.isFinite(fiveHour) || !Number.isFinite(weekly) || !Number.isFinite(credits)) {
+    console.error("ERROR: Codex manual values must be valid numbers.");
+    process.exit(1);
+  }
+
+  const { buildCodexManualSnapshots } = await import("../src/agent/collectors/codex");
+  const config = readAgentConfig();
+  const snapshots = buildCodexManualSnapshots({
+    fiveHourRemainingPct: fiveHour,
+    weeklyRemainingPct: weekly,
+    creditsRemaining: credits,
+    fiveHourReset: argValue("--five-hour-reset") ?? undefined,
+    weeklyReset: argValue("--weekly-reset") ?? undefined,
+  });
+
+  const deviceFingerprint = config.deviceFingerprint ?? deriveDeviceFingerprint(getDeviceName(), process.platform);
+  const { sanitize } = await import("../src/agent/sanitizer");
+  const payload = sanitize({
+    device: { deviceFingerprint, agentVersion: "0.1.0", os: process.platform },
+    quotaPoolSnapshots: snapshots,
+    toolQuotaAttributions: [],
+    toolInfos: [{
+      toolType: "codex",
+      displayName: "Codex CLI",
+      agentFingerprint: `codex-manual-${deviceFingerprint.slice(0, 8)}`,
+      metadata: JSON.stringify({ usageStatus: "manual_confirmed", pool: "Codex", manualSource: "screenshot" }),
+    }],
+  });
+
+  const deviceToken = getDeviceToken(config);
+  if (!deviceToken) {
+    console.error("ERROR: Device not registered. Run: ega-devtrack register --token <bootstrap-token>");
+    process.exit(1);
+  }
+
+  const apiBaseUrl = getApiBaseUrl(config);
+  const uploadUrl = `${apiBaseUrl}/api/ingest`;
+
+  console.log(`[agent] Uploading Codex manual usage to: ${uploadUrl}`);
+  for (const s of snapshots) {
+    const valueLabel = s.windowName === "codex-credits" ? `${s.usageAmount} remaining` : `${s.usageAmount}% used`;
+    console.log(`  ${s.windowName}: ${valueLabel} (source: ${s.source}, confidence: ${s.confidence})`);
+  }
+
+  try {
+    const response = await fetch(uploadUrl, {
+      method: "POST", headers: authHeaders(deviceToken), body: JSON.stringify(payload),
+    });
+    if (response.ok) {
+      console.log("[agent] Manual Codex usage uploaded SUCCESS");
+    } else {
+      const text = await response.text().catch(() => "unknown");
+      console.error(`[agent] Upload FAILED (HTTP ${response.status}): ${text}`);
+      process.exit(1);
+    }
+  } catch (err) {
+    console.error(`[agent] Upload NETWORK ERROR: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+// ── Stale Window Cleanup ───────────────────────────────────────────
+
+async function cmdCleanup(): Promise<void> {
+  const subcommand = args[1];
+  if (subcommand !== "stale-windows") {
+    console.error("ERROR: cleanup command requires 'stale-windows' subcommand.");
+    console.error("  Usage: ega-devtrack cleanup stale-windows --dry-run|--apply");
+    process.exit(1);
+  }
+
+  const apply = args.includes("--apply");
+  const dryRun = args.includes("--dry-run");
+  if (apply === dryRun) {
+    console.error("ERROR: choose exactly one of --dry-run or --apply.");
+    process.exit(1);
+  }
+
+  const config = readAgentConfig();
+  const deviceToken = getDeviceToken(config);
+  if (!deviceToken) {
+    console.error("ERROR: Device not registered. Run: ega-devtrack register --token <bootstrap-token>");
+    process.exit(1);
+  }
+
+  const apiBaseUrl = getApiBaseUrl(config);
+  const cleanupUrl = `${apiBaseUrl}/api/cleanup/stale-windows`;
+  const response = await fetch(cleanupUrl, {
+    method: "POST",
+    headers: authHeaders(deviceToken),
+    body: JSON.stringify({ apply }),
+  });
+
+  const body = await response.json().catch(() => ({})) as {
+    staleWindowCount?: number;
+    deletedCount?: number;
+    windowNames?: string[];
+    error?: string;
+  };
+
+  if (!response.ok) {
+    console.error(`[agent] Cleanup FAILED (HTTP ${response.status}): ${body.error ?? "unknown"}`);
+    process.exit(1);
+  }
+
+  console.log(`[agent] Stale window cleanup ${apply ? "APPLY" : "DRY-RUN"}`);
+  console.log(`  Matched: ${body.staleWindowCount ?? 0}`);
+  console.log(`  Deleted current_state rows: ${body.deletedCount ?? 0}`);
+  for (const name of body.windowNames ?? []) {
+    console.log(`  ${name}`);
+  }
+}
+
 // ── Usage Collection (with experimental browser collectors) ──────
 
 async function cmdUsageCollect(): Promise<void> {
@@ -908,6 +1048,16 @@ async function main(): Promise<void> {
 
   if (command === "opencode-go") {
     await cmdOpenCodeGoManual();
+    process.exit(0);
+  }
+
+  if (command === "codex") {
+    await cmdCodexManual();
+    process.exit(0);
+  }
+
+  if (command === "cleanup") {
+    await cmdCleanup();
     process.exit(0);
   }
 
