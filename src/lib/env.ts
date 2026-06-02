@@ -4,9 +4,10 @@ import { z } from "zod";
  * Public env vars — safe to import in client components.
  * Only NEXT_PUBLIC_* keys belong here.
  */
-const publicEnvSchema = z.object({
+const publicEnvBaseSchema = z.object({
   NEXT_PUBLIC_SUPABASE_URL: z.string().url(),
-  NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().min(1),
+  NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().min(1).optional(),
+  NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: z.string().min(1).optional(),
 });
 
 /**
@@ -18,9 +19,12 @@ const serverEnvSchema = z.object({
   DEVTRACK_AGENT_TOKEN_PEPPER: z.string().min(1),
 });
 
-const combinedSchema = publicEnvSchema.merge(serverEnvSchema);
+const combinedSchema = publicEnvBaseSchema.merge(serverEnvSchema).refine(
+  (env) => env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+  "NEXT_PUBLIC_SUPABASE_ANON_KEY or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is required",
+);
 
-type PublicEnv = z.infer<typeof publicEnvSchema>;
+type PublicEnv = z.infer<typeof publicEnvBaseSchema>;
 type ServerEnv = z.infer<typeof serverEnvSchema>;
 type Env = z.infer<typeof combinedSchema>;
 
@@ -53,6 +57,7 @@ export function getPublicEnv(): PublicEnv {
   return {
     NEXT_PUBLIC_SUPABASE_URL: env.NEXT_PUBLIC_SUPABASE_URL,
     NEXT_PUBLIC_SUPABASE_ANON_KEY: env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
   };
 }
 

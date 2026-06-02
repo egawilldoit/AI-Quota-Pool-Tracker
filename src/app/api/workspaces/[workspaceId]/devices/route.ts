@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDevicesWithHealth } from "@/lib/devices";
 
+export const dynamic = "force-dynamic";
+
 export async function GET(
   _request: NextRequest,
   { params }: { params: Promise<{ workspaceId: string }> },

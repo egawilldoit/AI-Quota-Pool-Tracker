@@ -5,7 +5,7 @@ import { workspaces, quotaPools, usageCurrentState } from "../src/lib/db/schema"
 import { eq } from "drizzle-orm";
 
 async function seed() {
-  console.log("🌱 Seeding quota pool data...");
+  console.log("🌱 Seeding demo quota pool data...");
 
   // ── Upsert default workspace ──────────────────────────────────
   let [workspace] = await db
@@ -117,7 +117,7 @@ async function seed() {
   }
   // No usage state inserted — remains "unknown"
 
-  console.log("\n✨ Seeding complete!");
+  console.log("\n✨ Demo seeding complete. Do not run against production unless demo data is intended.");
   process.exit(0);
 }
 

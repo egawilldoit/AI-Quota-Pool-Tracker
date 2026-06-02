@@ -246,7 +246,7 @@ npm run db:generate
 # Apply migrations to the database
 npm run db:migrate
 
-# (Optional) Seed initial data
+# (Optional) Seed demo data only. Do not run against production unless demo data is intended.
 npm run db:seed
 
 # (Optional) Open Drizzle Studio for inspecting data
