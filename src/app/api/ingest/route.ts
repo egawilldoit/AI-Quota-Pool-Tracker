@@ -135,7 +135,7 @@ export async function POST(request: NextRequest) {
           .where(
             and(
               eq(quotaPools.workspaceId, workspaceId),
-              sql`${quotaPools.id} = ANY(${poolIds}::uuid[])`,
+              sql`${quotaPools.id} = ANY(${sql.raw(`ARRAY[${poolIds.map((id) => `'${id}'::uuid`).join(",")}]`)})`,
             ),
           );
 
