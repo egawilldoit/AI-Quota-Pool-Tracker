@@ -1,5 +1,5 @@
 /**
- * OpenCode collector — classifies the active OpenCode provider via `opencode models`.
+ * OpenCode collector — classifies OpenCode provider via `opencode models`.
  *
  * Detects which provider(s) are configured by parsing model names:
  *   - Models starting with "opencode-go/" → OpenCode Go pool
@@ -7,8 +7,13 @@
  *   - Models starting with "opencode/"    → Free/Default (no separate billing)
  *   - Others → ignored for classification
  *
+ * OpenCode Go currently uses an API-key style connection flow (`opencode auth`
+ * / Zen `/connect`), but this collector does not read those keys and does not
+ * assume a stable official usage endpoint. Usage remains unknown/manual unless
+ * an official machine-readable usage API is added.
+ *
  * Only runs `opencode models` (safe subprocess) — NEVER reads auth.json,
- * config.jsonc, or any file containing tokens or secrets.
+ * config.jsonc, API keys, or any file containing tokens or secrets.
  * All output is sanitized via sanitize().
  */
 import { execFile } from "node:child_process";
@@ -136,6 +141,7 @@ export async function collectOpenCode(): Promise<OpenCodeCollectorResult> {
     metadata: JSON.stringify({
       version: "detected",
       pool: pool.poolName,
+      usageStatus: "unknown_manual_required",
       modelsCount: entries.length,
       detectedProviders: [...new Set(entries.map((e) => e.provider))].sort(),
     }),
@@ -147,6 +153,7 @@ export async function collectOpenCode(): Promise<OpenCodeCollectorResult> {
     modelsCount: entries.length,
     detectedProviders: [...new Set(entries.map((e) => e.provider))].sort(),
     classifiedPool: pool.poolName,
+    usageStatus: "unknown_manual_required",
   };
 
   const result: OpenCodeCollectorResult = {

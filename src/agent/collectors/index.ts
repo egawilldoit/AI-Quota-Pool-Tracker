@@ -23,7 +23,7 @@ export interface CollectorRunResult {
  * normalized ingest payload. Catches all errors so a single collector
  * failure never crashes the agent.
  */
-export async function runAllCollectors(): Promise<CollectorRunResult> {
+export async function runAllCollectors(device?: Partial<IngestPayload["device"]>): Promise<CollectorRunResult> {
   const errors: string[] = [];
   const allSnapshots: QuotaPoolSnapshot[] = [];
   const allToolInfos: ToolInfo[] = [];
@@ -68,9 +68,9 @@ export async function runAllCollectors(): Promise<CollectorRunResult> {
   // Build normalized payload
   const rawPayload: IngestPayload = {
     device: {
-      deviceFingerprint: "dry-run-device-001",
-      agentVersion: "0.1.0",
-      os: process.platform,
+      deviceFingerprint: device?.deviceFingerprint ?? "dry-run-device-001",
+      agentVersion: device?.agentVersion ?? "0.1.0",
+      os: device?.os ?? process.platform,
     },
     quotaPoolSnapshots: allSnapshots,
     toolQuotaAttributions: allAttributions,

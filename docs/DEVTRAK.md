@@ -60,11 +60,16 @@ You can create additional custom pools via the [dashboard](/dashboard) for any w
 
 ### Codex / ChatGPT
 
-The agent detects Codex CLI by reading `~/.codex/config.toml` — specifically the top-level `model = "..."` field (e.g. `gpt-5.5`).
+The agent detects Codex CLI by reading `~/.codex/config.toml` — specifically the top-level `model = "..."` field (e.g. `gpt-5.5`). It also attempts safe CLI status collection:
+
+1. `codex status --json` if supported
+2. `codex status` text parsing as fallback
+3. Model-only heartbeat if no machine-readable usage is available
 
 - **Model classification:** Models starting with `gpt-`, `o1`, `o3`, or `o4` are classified as **high-confidence paid** (confidence 0.9) and mapped to the **Codex-ChatGPT** pool.
 - All other models are classified as moderate confidence (0.7).
-- **Privacy:** Only the model name is read. The agent **never** reads `~/.codex/auth.json` (contains tokens).
+- **Usage:** Status parsing records percent-style usage only when the CLI exposes it. Otherwise usage amount is `0` with source `heartbeat`.
+- **Privacy:** Only the model name is read. The agent **never** reads or uploads `~/.codex/auth.json` (contains tokens).
 - If Codex is not installed or config is missing, the agent records a `detected: false` ToolInfo and produces no snapshots.
 
 ### OpenCode Go
@@ -76,7 +81,9 @@ The agent runs `opencode models` as a subprocess and parses the model list to de
   - Models prefixed `openai/` → **OpenAI Provider** pool (confidence 0.7)
   - Models prefixed `opencode/` → **Free** pool (confidence 0.5)
   - Other providers are ignored — the agent cannot classify them with confidence
-- **Privacy:** Only the model names from `opencode models` are parsed. The agent **never** reads `auth.json`, `config.jsonc`, or any file containing tokens or secrets.
+- **Current auth reality:** OpenCode Go uses an API-key style connection flow (`opencode auth` / OpenCode Zen `/connect`). The agent does not read those API keys.
+- **Usage:** No stable official machine-readable OpenCode Go usage endpoint is implemented here. The collector classifies provider/model and marks usage as `unknown_manual_required`.
+- **Privacy:** Only the model names from `opencode models` are parsed. The agent **never** reads `auth.json`, `config.jsonc`, API keys, or any file containing tokens or secrets.
 - If `opencode` is not on `$PATH` or the command fails, the collector returns empty data gracefully.
 
 ### Hermes Agent
@@ -90,6 +97,7 @@ The agent reads `~/.hermes/config.yaml` to determine the active provider and mod
   - Model ending in `:free` → **Free** pool (confidence 0.5)
   - All others → **Unknown** pool (confidence 0.3)
 - **Privacy:** Only the `provider` and `model` fields from the `delegation` or `model.default` section of `config.yaml` are extracted. The agent **never** reads `~/.hermes/.env` (contains API keys), memory files, session files, prompts, or completions.
+- **Usage:** Hermes provider/model routing is attributed to the matching pool. If Hermes routes through OpenCode Go, it is attributed to OpenCode Go. Usage amount remains unknown/manual unless the upstream provider exposes safe usage data.
 - If Hermes is not installed or config is missing, the agent records `detected: false` and produces no snapshots.
 
 ### Manual Usage Fallback
@@ -275,6 +283,49 @@ npm run build
 
 After building, the TypeScript CLI (`scripts/ega-devtrack.ts`) is compiled to `scripts/ega-devtrack.js` and ready to use directly or via npm scripts.
 
+### Production Agent Setup
+
+The dashboard cannot know local Codex/OpenCode/Hermes usage until a local agent is registered and uploads. Run these commands on the VM or local PC that has the tools/configs installed.
+
+1. Generate a bootstrap token in the dashboard:
+
+```text
+https://ai-quota-pool-tracker.vercel.app/devices/add
+```
+
+2. Register the device. The bootstrap token is consumed once; the returned device token is saved locally at `~/.local/share/ega-devtrack/config.json`.
+
+```bash
+DEVTRAK_API_URL=https://ai-quota-pool-tracker.vercel.app \
+  node scripts/ega-devtrack.js register --token <bootstrap-token>
+```
+
+3. Preview normalized data locally. This uploads nothing.
+
+```bash
+node scripts/ega-devtrack.js once --dry-run
+```
+
+4. Upload one real payload.
+
+```bash
+node scripts/ega-devtrack.js once --upload
+```
+
+5. Install Linux scheduler if wanted.
+
+```bash
+node scripts/ega-devtrack.js install
+```
+
+6. Verify dashboard.
+
+```text
+https://ai-quota-pool-tracker.vercel.app/dashboard
+```
+
+Expected behavior: demo seed rows remain visible only until real device/current-state data exists. Real `usage_current_state` rows update the quota pool display and the demo banner clears.
+
 ---
 
 ## CLI Commands
@@ -307,7 +358,7 @@ Collect data and upload to the server. Before collecting fresh data, retries any
 ```bash
 node scripts/ega-devtrack.js once --upload
 # or
-npm run agent:upload    # (if configured in package.json)
+npm run agent:upload
 ```
 
 **Flow:**
@@ -316,7 +367,24 @@ npm run agent:upload    # (if configured in package.json)
 3. Upload payload to `{DEVTRAK_API_URL}/api/ingest`
 4. On failure: spool the payload to `~/.local/share/ega-devtrack/spool/` for later retry
 
-**Required:** `DEVTRAK_API_URL` env var (defaults to `http://localhost:3000`).
+**Required:** registered device token, from `ega-devtrack register --token <bootstrap-token>`. The upload sends `Authorization: Bearer <device-token>` to `POST /api/ingest`; token value is never printed.
+
+`DEVTRAK_API_URL` defaults to saved registration endpoint, then `http://localhost:3000`.
+
+### register
+
+Register this local machine against the server using a short-lived bootstrap token from `/devices/add`.
+
+```bash
+DEVTRAK_API_URL=https://ai-quota-pool-tracker.vercel.app \
+  node scripts/ega-devtrack.js register --token <bootstrap-token>
+```
+
+Options:
+- `--endpoint <url>` overrides `DEVTRAK_API_URL`
+- `--device-name <name>` sets the dashboard device label
+
+The command saves only the device token and endpoint locally. It does not upload Codex/OpenCode/Hermes secrets.
 
 ### privacy-report
 
@@ -330,7 +398,7 @@ npm run agent:privacy-report
 
 ### install (Linux)
 
-Install a systemd user timer that runs `ega-devtrack once` every 15 minutes.
+Install a systemd user timer that runs `ega-devtrack once --upload` every 15 minutes.
 
 ```bash
 node scripts/ega-devtrack.js install
@@ -347,7 +415,7 @@ npm run agent:install
 4. Runs `systemctl --user daemon-reload`
 5. Enables and starts the timer: `systemctl --user enable --now ega-devtrack.timer`
 
-**Note:** The timer currently runs `ega-devtrack once --dry-run` (dry-run mode). Scheduled uploads will be enabled once upload mode is fully implemented.
+**Note:** Run `ega-devtrack register --token <bootstrap-token>` before installing the scheduler.
 
 ### install (Windows)
 
@@ -361,7 +429,7 @@ node scripts/ega-devtrack.js status
 For manual scheduling on Windows, use Task Scheduler to run:
 ```powershell
 # Every 15 minutes, run:
-node C:\path\to\project\scripts\ega-devtrack.js once --dry-run
+node C:\path\to\project\scripts\ega-devtrack.js once --upload
 ```
 
 Cross-platform support (Task Scheduler / launchd) is planned for a future release.
@@ -413,6 +481,7 @@ If the scheduler is not installed, prints a prompt to run `install`.
 | Command                        | Equivalent                                              |
 |--------------------------------|---------------------------------------------------------|
 | `npm run agent:dry-run`        | `node scripts/ega-devtrack.js once --dry-run`           |
+| `npm run agent:upload`         | `node scripts/ega-devtrack.js once --upload`            |
 | `npm run agent:privacy-report` | `node scripts/ega-devtrack.js privacy-report`           |
 | `npm run agent:help`           | `node scripts/ega-devtrack.js --help`                   |
 | `npm run agent:install`        | `node scripts/ega-devtrack.js install`                  |
@@ -447,7 +516,8 @@ A device becomes **stale** when the server hasn't received a heartbeat or upload
 1. Go to the dashboard → **Devices** → **Add Device**
 2. Generate a new bootstrap token
 3. Set the token as an env var or pass it to the agent
-4. Run `ega-devtrack once --upload` to re-register
+4. Run `ega-devtrack register --token <bootstrap-token>`
+5. Run `ega-devtrack once --upload`
 
 ### Token Revoke / Rotate
 
@@ -455,15 +525,15 @@ If a device token is compromised, lost, or needs to be rotated:
 
 1. **Revoke the old token** in the Supabase dashboard → `bootstrap_tokens` table → set `is_active = false` (or delete the row)
 2. **Generate a new token** from the dashboard at `/devices/add`
-3. Set the new token on the device:
+3. Register with the new bootstrap token:
    ```bash
-   export DEVICE_TOKEN=<new-token>
+   node scripts/ega-devtrack.js register --token <bootstrap-token>
    ```
-4. Test the new token:
+4. Test collection:
    ```bash
    node scripts/ega-devtrack.js once --dry-run
    ```
-5. Run an upload to re-register the device:
+5. Run an upload:
    ```bash
    node scripts/ega-devtrack.js once --upload
    ```
@@ -504,7 +574,7 @@ The following features are planned but **not yet implemented** in the MVP:
 - **Working hours tracking** — time-of-day and day-of-week filtering for quota consumption
 - **Windows scheduler** — automatic Task Scheduler integration
 - **macOS scheduler** — launchd plist generation
-- **Upload mode in timer** — the systemd timer currently runs `once --dry-run`; scheduled upload will replace this once upload mode is production-ready
+- **OpenCode Go usage API** — provider detection works, but usage amount stays manual/unknown until an official machine-readable usage API is available
 
 ---
 

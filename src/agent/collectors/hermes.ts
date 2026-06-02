@@ -232,6 +232,8 @@ export async function collectHermes(): Promise<HermesCollectorResult> {
         provider: config.provider,
         model: config.model,
         pool: pool.poolName,
+        usageStatus:
+          pool.poolName === "OpenCode Go" ? "attributed_to_opencode_go" : "unknown_manual_required",
       }),
     },
   ];
